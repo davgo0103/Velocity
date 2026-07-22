@@ -97,6 +97,8 @@ public class VelocityConfiguration implements ProxyConfig {
   private boolean forceKeyAuthentication = true; // Added in 1.19
   @Expose
   private PacketLimiterConfig packetLimiterConfig = PacketLimiterConfig.DEFAULT;
+  @Expose
+  private SeamlessTransfersConfig seamlessTransfersConfig = SeamlessTransfersConfig.DEFAULT;
 
   private VelocityConfiguration(Servers servers, ForcedHosts forcedHosts, Advanced advanced,
       Query query, Metrics metrics) {
@@ -113,7 +115,8 @@ public class VelocityConfiguration implements ProxyConfig {
       boolean onlineModeKickExistingPlayers, PingPassthroughMode pingPassthrough,
       boolean samplePlayersInPing, boolean enablePlayerAddressLogging, Servers servers,
       ForcedHosts forcedHosts, Advanced advanced, Query query, Metrics metrics,
-      boolean forceKeyAuthentication, PacketLimiterConfig packetLimiterConfig) {
+      boolean forceKeyAuthentication, PacketLimiterConfig packetLimiterConfig,
+      SeamlessTransfersConfig seamlessTransfersConfig) {
     this.bind = bind;
     this.motd = motd;
     this.showMaxPlayers = showMaxPlayers;
@@ -133,6 +136,7 @@ public class VelocityConfiguration implements ProxyConfig {
     this.metrics = metrics;
     this.forceKeyAuthentication = forceKeyAuthentication;
     this.packetLimiterConfig = packetLimiterConfig;
+    this.seamlessTransfersConfig = seamlessTransfersConfig;
   }
 
   /**
@@ -451,6 +455,10 @@ public class VelocityConfiguration implements ProxyConfig {
     return advanced.isEnableReusePort();
   }
 
+  public SeamlessTransfersConfig getSeamlessTransfersConfig() {
+    return seamlessTransfersConfig;
+  }
+
   public PacketLimiterConfig getPacketLimiterConfig() {
     return packetLimiterConfig;
   }
@@ -571,6 +579,8 @@ public class VelocityConfiguration implements ProxyConfig {
       final boolean enablePlayerAddressLogging = config.getOrElse(
               "enable-player-address-logging", true);
       final PacketLimiterConfig packetLimiterConfig = PacketLimiterConfig.fromConfig(config.get("packet-limiter"));
+      final SeamlessTransfersConfig seamlessTransfersConfig =
+          SeamlessTransfersConfig.fromConfig(config.get("seamless-transfers"));
 
       // Throw an exception if the forwarding-secret file is empty and the proxy is using a
       // forwarding mode that requires it.
@@ -599,7 +609,8 @@ public class VelocityConfiguration implements ProxyConfig {
               new Query(queryConfig),
               new Metrics(metricsConfig),
               forceKeyAuthentication,
-              packetLimiterConfig
+              packetLimiterConfig,
+              seamlessTransfersConfig
       );
     }
   }
@@ -1000,6 +1011,102 @@ public class VelocityConfiguration implements ProxyConfig {
 
     public boolean isEnabled() {
       return enabled;
+    }
+  }
+
+  /**
+   * Configuration for experimental seamless server transfers. When enabled, players switching
+   * between backend servers listed in the same group stay in the PLAY state: the proxy answers
+   * the new server's configuration phase itself, buffers the initial world snapshot and
+   * hot-swaps the backend without sending the client any world-switch packet — the shared world
+   * template means the terrain on screen is already correct, so no loading screen can appear.
+   *
+   * @param enabled                whether seamless transfers are enabled at all
+   * @param serverGroups           groups of server names sharing the same world template +
+   *                               player data
+   * @param commitGraceMs          quiet window (ms) with no new chunk-sized packets before the
+   *                               snapshot is applied
+   * @param commitTimeoutMs        hard deadline (ms) after JoinGame before the snapshot is
+   *                               force-applied
+   * @param prepareTimeoutMs       deadline (ms) for the whole prepare phase before falling back
+   * @param chunkPacketMinBytes    packets at least this large are considered chunk data for the
+   *                               version-independent snapshot-completion heuristic
+   * @param commitChunkPackets     commit as soon as this many chunk-sized packets have been
+   *                               buffered; servers send chunks closest to the player first
+   * @param addEntityPacketId      clientbound packet id (decimal) of "Spawn Entity" for the
+   *                               protocol version in use; enables ghost-entity tracking.
+   *                               -1 disables tracking
+   * @param removeEntitiesPacketId clientbound packet id (decimal) of "Remove Entities" for
+   *                               the protocol version in use; -1 disables ghost cleanup
+   * @param verbose                whether to log the packet timeline of every seamless switch
+   */
+  public record SeamlessTransfersConfig(boolean enabled, List<List<String>> serverGroups,
+                                        int commitGraceMs, int commitTimeoutMs,
+                                        int prepareTimeoutMs, int chunkPacketMinBytes,
+                                        int commitChunkPackets, int addEntityPacketId,
+                                        int removeEntitiesPacketId, boolean verbose) {
+    public static final SeamlessTransfersConfig DEFAULT =
+        new SeamlessTransfersConfig(false, List.of(), 150, 2000, 5000, 4096, 25, -1, -1, false);
+
+    /**
+     * Whether ghost-entity tracking (needed to clean up the previous server's entities at the
+     * swap) is fully configured.
+     *
+     * @return true if both entity packet ids are set
+     */
+    public boolean entityTrackingEnabled() {
+      return enabled && addEntityPacketId >= 0 && removeEntitiesPacketId >= 0;
+    }
+
+    /**
+     * Returns a SeamlessTransfersConfig from a config section, or the default if the section
+     * is null.
+     *
+     * @param config the configuration section to parse
+     * @return the seamless transfers config, or the default if {@code config} is null
+     */
+    public static SeamlessTransfersConfig fromConfig(CommentedConfig config) {
+      if (config == null) {
+        return DEFAULT;
+      }
+      final List<List<String>> groups = config.getOrElse("server-groups", List.of());
+      return new SeamlessTransfersConfig(
+          config.getOrElse("enabled", DEFAULT.enabled()),
+          groups,
+          config.getIntOrElse("commit-grace-ms", DEFAULT.commitGraceMs()),
+          config.getIntOrElse("commit-timeout-ms", DEFAULT.commitTimeoutMs()),
+          config.getIntOrElse("prepare-timeout-ms", DEFAULT.prepareTimeoutMs()),
+          config.getIntOrElse("chunk-packet-min-bytes", DEFAULT.chunkPacketMinBytes()),
+          config.getIntOrElse("commit-chunk-packets", DEFAULT.commitChunkPackets()),
+          config.getIntOrElse("add-entity-packet-id", DEFAULT.addEntityPacketId()),
+          config.getIntOrElse("remove-entities-packet-id", DEFAULT.removeEntitiesPacketId()),
+          config.getOrElse("verbose", DEFAULT.verbose())
+      );
+    }
+
+    /**
+     * Checks whether both servers are members of the same seamless group.
+     *
+     * @param from the name of the server the player is leaving
+     * @param to   the name of the server the player is joining
+     * @return true if a configured group contains both servers
+     */
+    public boolean inSameGroup(String from, String to) {
+      for (List<String> group : serverGroups) {
+        if (containsIgnoreCase(group, from) && containsIgnoreCase(group, to)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    private static boolean containsIgnoreCase(List<String> group, String name) {
+      for (String member : group) {
+        if (member.equalsIgnoreCase(name)) {
+          return true;
+        }
+      }
+      return false;
     }
   }
 

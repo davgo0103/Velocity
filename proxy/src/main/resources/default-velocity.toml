@@ -202,3 +202,51 @@ map = "Velocity"
 
 # Whether plugins should be shown in query response by default or not
 show-plugins = false
+
+[seamless-transfers]
+# EXPERIMENTAL: keep players in the PLAY state when switching between backend servers of the
+# same group. The proxy answers the new server's configuration phase itself, buffers its
+# initial world snapshot and hot-swaps the backend without sending the client any world-switch
+# packet, so no loading screen appears. Both servers of a group MUST share the same world
+# template (dimension types, world names) and the same player data (position, inventory,
+# health), e.g. via a player-data synchronization plugin. If those preconditions do not hold,
+# leave this disabled.
+enabled = false
+
+# Groups of servers that share a world template and player data. Seamless transfers only
+# happen between servers listed in the same group; all other switches use the normal path.
+# Example: server-groups = [ ["lobby", "survival"], ["mini1", "mini2"] ]
+server-groups = []
+
+# Clientbound packet ids (decimal) of "Spawn Entity" and "Remove Entities" for the protocol
+# version your players use, from the protocol documentation (e.g. minecraft.wiki). Required so
+# the previous server's entities can be removed at the swap; without them they linger as ghosts
+# and their ids may collide with the new server's (client crashes). -1 disables cleanup.
+add-entity-packet-id = -1
+remove-entities-packet-id = -1
+
+# Commit as soon as this many chunk-sized packets have been buffered. Servers send the chunks
+# closest to the player first, so the area around the player refreshes before the swap; the
+# remaining chunks continue streaming normally afterwards. Roughly (2r+1)^2 for a radius r.
+# Set to 0 to disable and rely on the quiet window/timeout instead.
+commit-chunk-packets = 25
+
+# Packets at least this large (bytes) are considered chunk data for the version-independent
+# snapshot-completion heuristic. Lower this for very sparse worlds (superflat/void).
+chunk-packet-min-bytes = 4096
+
+# Quiet window in milliseconds: once chunk data has been observed, the snapshot is applied
+# after no further chunk-sized packets arrive for this long.
+commit-grace-ms = 150
+
+# Hard deadline in milliseconds after the target server's JoinGame packet; the snapshot is
+# applied even if it may still be incomplete.
+commit-timeout-ms = 2000
+
+# Deadline in milliseconds for the target server to finish login + configuration before the
+# seamless attempt is aborted (the player simply stays on the current server).
+prepare-timeout-ms = 5000
+
+# Log the packet timeline (prepare/buffer/commit durations, buffered packet counts) of every
+# seamless switch. Useful for tuning the values above.
+verbose = false
