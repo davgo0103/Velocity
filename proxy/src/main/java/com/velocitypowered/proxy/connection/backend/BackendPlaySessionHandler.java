@@ -192,6 +192,7 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
     return false; // forwards on
   }
 
+
   @Override
   public boolean handle(ClientSettingsPacket packet) {
     serverConn.ensureConnected().write(packet);
@@ -495,6 +496,30 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
+    if (System.nanoTime() < serverConn.getSuppressLoadScreenUntilNanos()) {
+      // Velocity registers Respawn encode-only, so a backend Respawn arrives opaque: a genuine
+      // world change during the seamless-join window. The client rebuilds its level and needs
+      // the "start waiting for chunks" events again — cancel the suppression before forwarding.
+      final int respawnId =
+          SeamlessPacketIds.respawnId(serverConn.getPlayer().getProtocolVersion());
+      if (respawnId >= 0 && SeamlessPacketIds.peekVarInt(buf) == respawnId) {
+        serverConn.setSuppressLoadScreenUntilNanos(0);
+        if (server.getConfiguration().getSeamlessTransfersConfig().verbose()) {
+          logger.info("Seamless: live Respawn from {} during the join window for {} — genuine "
+                  + "world change, load-screen suppression cancelled (a real reload follows)",
+              serverConn.getServerInfo().getName(), serverConn.getPlayer().getUsername());
+        }
+      } else if (SeamlessPacketIds.isLevelLoadStartEvent(buf)) {
+        // Straggler "start waiting for chunks" event from the seamless join sequence: the
+        // client already has the shared world, and on ≤1.21.1 this event would open the
+        // "loading terrain" screen unconditionally. See SeamlessSwitchController.
+        if (server.getConfiguration().getSeamlessTransfersConfig().verbose()) {
+          logger.info("Seamless: dropped straggler load-screen event from {} for {}",
+              serverConn.getServerInfo().getName(), serverConn.getPlayer().getUsername());
+        }
+        return;
+      }
+    }
     if (trackEntityIds) {
       trackEntityIds(buf);
     }

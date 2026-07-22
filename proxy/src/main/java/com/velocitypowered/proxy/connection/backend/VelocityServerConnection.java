@@ -74,6 +74,7 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
   private BackendConnectionPhase connectionPhase = BackendConnectionPhases.UNKNOWN;
   private final Map<Long, Long> pendingPings = new HashMap<>();
   private final Set<Integer> trackedEntityIds = new HashSet<>();
+  private long suppressLoadScreenUntilNanos;
   private @MonotonicNonNull Integer entityId;
 
   /**
@@ -337,6 +338,23 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
    */
   public Set<Integer> getTrackedEntityIds() {
     return trackedEntityIds;
+  }
+
+  /**
+   * While a seamless transfer's join sequence is running, the backend's "start waiting for
+   * chunks" game events are dropped so the client — which already has the shared world — never
+   * opens the "loading terrain" screen (on ≤1.21.1 the event opens it unconditionally, causing
+   * an intermittent one-frame flash). The window is cancelled early if the backend sends a
+   * Respawn (a genuine world change, where the event is needed).
+   *
+   * @return the {@link System#nanoTime()} deadline until which the event is suppressed
+   */
+  public long getSuppressLoadScreenUntilNanos() {
+    return suppressLoadScreenUntilNanos;
+  }
+
+  public void setSuppressLoadScreenUntilNanos(long deadlineNanos) {
+    this.suppressLoadScreenUntilNanos = deadlineNanos;
   }
 
   public Integer getEntityId() {

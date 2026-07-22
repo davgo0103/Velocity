@@ -88,6 +88,7 @@ public final class SeamlessSwitchController {
   private final CompletableFuture<Impl> resultFuture;
   private final SeamlessTransfersConfig config;
   private final int chunkBatchFinishedId;
+  private final int respawnId;
 
   private State state = State.PREPARING;
   private final ArrayDeque<Object> buffer = new ArrayDeque<>();
@@ -103,6 +104,8 @@ public final class SeamlessSwitchController {
   private int bufferedTargetPackets;
   private int chunkSizedPacketsSeen;
   private int droppedSourcePackets;
+  private int suppressedLoadScreenEvents;
+  private boolean worldChangeSeen;
 
   /**
    * Creates a controller for one seamless switch attempt.
@@ -121,6 +124,7 @@ public final class SeamlessSwitchController {
     this.resultFuture = resultFuture;
     this.config = server.getConfiguration().getSeamlessTransfersConfig();
     this.chunkBatchFinishedId = SeamlessPacketIds.chunkBatchFinishedId(player.getProtocolVersion());
+    this.respawnId = SeamlessPacketIds.respawnId(player.getProtocolVersion());
     if (!SeamlessPacketIds.entityCleanupSupported(player.getProtocolVersion())) {
       logger.warn("Seamless transfer for {}: entity packet ids are not known for {}; the "
               + "previous server's entities cannot be cleaned up and will linger as ghosts "
@@ -209,7 +213,8 @@ public final class SeamlessSwitchController {
     }
     // COMMITTING still buffers: packets decoded between the commit decision and the snapshot
     // flush would otherwise be lost. The flush drains the buffer after the connect event, so
-    // late additions are included.
+    // late additions are included. (Respawn detection happens in bufferUnknown: Velocity
+    // registers RespawnPacket encode-only, so a backend Respawn always arrives opaque.)
     ReferenceCountUtil.retain(packet);
     buffer.add(packet);
     bufferedTargetPackets++;
@@ -225,11 +230,22 @@ public final class SeamlessSwitchController {
     if (state != State.BUFFERING && state != State.COMMITTING) {
       return;
     }
-    // Every packet — including the "start waiting for chunks" game event — is buffered and later
-    // forwarded unchanged. The event is deliberately NOT dropped: with synchronized player data
-    // the client is already at this position with the chunk loaded, so the "waiting for chunks"
-    // state resolves on the next frame and no screen is perceptible. Dropping it instead leaves
-    // the client unable to complete the load handshake (a stuck loading screen on 1.21+).
+    if (respawnId >= 0 && SeamlessPacketIds.peekVarInt(buf) == respawnId) {
+      // A genuine world change inside the target's join sequence (Velocity registers Respawn
+      // encode-only, so it arrives opaque and must be recognized by id). The client will
+      // rebuild its level when this is flushed, so the "start waiting for chunks" events are
+      // needed after all — stop suppressing them for this transfer.
+      worldChangeSeen = true;
+    }
+    if (!worldChangeSeen && SeamlessPacketIds.isLevelLoadStartEvent(buf)) {
+      // Never let the client see this event during a same-world seamless join: on ≤1.21.1 it
+      // opens the "loading terrain" screen unconditionally, even though the shared world is
+      // already loaded, producing an intermittent one-frame flash. BackendPlaySessionHandler
+      // keeps dropping stragglers for a window after the commit. If a Respawn was buffered
+      // (genuine world change), the events pass through instead — the client really reloads.
+      suppressedLoadScreenEvents++;
+      return;
+    }
     buffer.add(buf.retain());
     bufferedTargetPackets++;
     if (state != State.BUFFERING) {
@@ -336,6 +352,16 @@ public final class SeamlessSwitchController {
 
           playHandler.doSeamlessSwitch(targetJoinGame, target, buffer);
 
+          // The backend may emit further "start waiting for chunks" events late in its join
+          // sequence (e.g. a sync plugin's delayed teleport); keep dropping them on the live
+          // path long enough to cover the whole join. Skipped entirely when the join sequence
+          // contained a Respawn (genuine world change — the client reloads and needs the
+          // events); a live Respawn also cancels the window immediately.
+          if (!worldChangeSeen) {
+            target.setSuppressLoadScreenUntilNanos(
+                System.nanoTime() + TimeUnit.SECONDS.toNanos(10));
+          }
+
           // Resume normal packet dispatch on the target: from here it is a fully live backend.
           smc.interceptingPackets = false;
           smc.setActiveSessionHandler(StateRegistry.PLAY,
@@ -356,12 +382,14 @@ public final class SeamlessSwitchController {
             final long now = System.nanoTime();
             logger.info("Seamless transfer for {} -> {} committed ({}): prepare={}ms, "
                     + "buffer={}ms, commit={}ms, bufferedTargetPackets={}, "
-                    + "chunkSizedPackets={}, droppedSourcePackets={}",
+                    + "chunkSizedPackets={}, suppressedLoadScreenEvents={}, worldChange={}, "
+                    + "droppedSourcePackets={}",
                 player.getUsername(), target.getServerInfo().getName(), trigger,
                 TimeUnit.NANOSECONDS.toMillis(joinGameNanos - prepareStartNanos),
                 TimeUnit.NANOSECONDS.toMillis(commitStartNanos - joinGameNanos),
                 TimeUnit.NANOSECONDS.toMillis(now - commitStartNanos),
-                bufferedTargetPackets, chunkSizedPacketsSeen, droppedSourcePackets);
+                bufferedTargetPackets, chunkSizedPacketsSeen, suppressedLoadScreenEvents,
+                worldChangeSeen, droppedSourcePackets);
           }
         }, smc.eventLoop()).exceptionally(exc -> {
           logger.error("Unable to seamlessly switch to new server {} for {}",
