@@ -21,6 +21,9 @@ import static com.velocitypowered.proxy.protocol.util.PluginMessageUtil.construc
 
 import com.google.common.collect.ImmutableList;
 import com.mojang.brigadier.suggestion.Suggestion;
+import com.mojang.brigadier.tree.RootCommandNode;
+import com.velocitypowered.api.command.CommandSource;
+import com.velocitypowered.api.event.command.PlayerAvailableCommandsEvent;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
 import com.velocitypowered.api.event.player.CookieReceiveEvent;
 import com.velocitypowered.api.event.player.PlayerChannelRegisterEvent;
@@ -40,19 +43,25 @@ import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.connection.forge.legacy.LegacyForgeConstants;
 import com.velocitypowered.proxy.connection.player.resourcepack.ResourcePackResponseBundle;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
+import com.velocitypowered.proxy.protocol.packet.AvailableCommandsPacket;
 import com.velocitypowered.proxy.protocol.packet.BossBarPacket;
+import com.velocitypowered.proxy.protocol.packet.BundleDelimiterPacket;
 import com.velocitypowered.proxy.protocol.packet.ClientSettingsPacket;
 import com.velocitypowered.proxy.protocol.packet.JoinGamePacket;
 import com.velocitypowered.proxy.protocol.packet.KeepAlivePacket;
+import com.velocitypowered.proxy.protocol.packet.LegacyPlayerListItemPacket;
 import com.velocitypowered.proxy.protocol.packet.PluginMessagePacket;
+import com.velocitypowered.proxy.protocol.packet.RemovePlayerInfoPacket;
 import com.velocitypowered.proxy.protocol.packet.ResourcePackResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.RespawnPacket;
 import com.velocitypowered.proxy.protocol.packet.ServerboundCookieResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteRequestPacket;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteResponsePacket;
 import com.velocitypowered.proxy.protocol.packet.TabCompleteResponsePacket.Offer;
+import com.velocitypowered.proxy.protocol.packet.UpsertPlayerInfoPacket;
 import com.velocitypowered.proxy.protocol.packet.chat.ChatAcknowledgementPacket;
 import com.velocitypowered.proxy.protocol.packet.chat.ChatHandler;
 import com.velocitypowered.proxy.protocol.packet.chat.ChatTimeKeeper;
@@ -81,6 +90,7 @@ import io.netty.util.ReferenceCountUtil;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.List;
 import java.util.Queue;
 import java.util.UUID;
@@ -607,9 +617,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       player.getTabList().clearAllSilent();
       if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
         player.getBossBarManager().dropPackets();
-      } else {
-        serverBossBars.clear();
       }
+      // The config state clears boss bars on the client; drop the tracked ids as well.
+      serverBossBars.clear();
     }
 
     player.switchToConfigState();
@@ -714,6 +724,147 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
     player.getConnection().delayedWrite(joinGame);
     player.getConnection().delayedWrite(respawn);
+  }
+
+  /**
+   * Applies a seamless (PLAY-state) server switch: instead of the configuration-state reset, the
+   * client receives a same-dimension respawn followed immediately by the buffered world snapshot
+   * of the target server, all in a single flush. Leftover UI state from the previous server (tab
+   * list, header/footer, boss bars, titles) is cleared in the same batch.
+   *
+   * <p>Must be called on the player's event loop while the client is in the PLAY state; the
+   * buffered messages are written in their original order and ownership of their reference
+   * counts is taken over by this method.</p>
+   *
+   * @param joinGame    the target server's JoinGame packet (never sent to the client itself)
+   * @param destination the new server we are connecting to
+   * @param buffered    the target server's buffered packets, starting after JoinGame
+   */
+  public void doSeamlessSwitch(JoinGamePacket joinGame, VelocityServerConnection destination,
+      Deque<Object> buffered) {
+    final MinecraftConnection clientConn = player.getConnection();
+    final MinecraftConnection serverMc = destination.ensureConnected();
+
+    // Close any bundle the previous server left open, so the snapshot applies immediately.
+    if (player.getBundleHandler().isInBundleSession()) {
+      player.getBundleHandler().toggleBundleSession();
+      clientConn.delayedWrite(BundleDelimiterPacket.INSTANCE);
+    }
+
+    // Clear UI leftovers of the previous server. A same-dimension respawn only resets the world
+    // and entities; HUD state must be removed explicitly.
+    player.getTabList().clearAll();
+    player.clearPlayerListHeaderAndFooter();
+    for (UUID serverBossBar : serverBossBars) {
+      final BossBarPacket deletePacket = new BossBarPacket();
+      deletePacket.setUuid(serverBossBar);
+      deletePacket.setAction(BossBarPacket.REMOVE);
+      clientConn.delayedWrite(deletePacket);
+    }
+    serverBossBars.clear();
+    clientConn.delayedWrite(
+        GenericTitlePacket.constructTitlePacket(GenericTitlePacket.ActionType.RESET,
+            player.getProtocolVersion()));
+
+    // Hot-swap: no world-switch packet at all — a JoinGame or Respawn would put the client
+    // into the waiting-for-level screen state. The client keeps its level (both servers share
+    // the same world template, so the terrain on screen is already correct) and the target's
+    // position sync, chunks and entity spawns in the snapshot simply take over. The previous
+    // server's entities survive and are removed explicitly (when entity tracking is
+    // configured); the player also keeps its old entity id (see TODO below).
+    final VelocityServerConnection previous = player.getConnectedServer();
+    final var seamlessConfig = server.getConfiguration().getSeamlessTransfersConfig();
+    if (previous != null && seamlessConfig.removeEntitiesPacketId() >= 0) {
+      final var ghosts = previous.getTrackedEntityIds();
+      if (!ghosts.isEmpty()) {
+        final ByteBuf removeGhosts = Unpooled.buffer();
+        ProtocolUtils.writeVarInt(removeGhosts, seamlessConfig.removeEntitiesPacketId());
+        ProtocolUtils.writeVarInt(removeGhosts, ghosts.size());
+        for (int ghostId : ghosts) {
+          ProtocolUtils.writeVarInt(removeGhosts, ghostId);
+        }
+        clientConn.delayedWrite(removeGhosts);
+      }
+    }
+
+    // Stream the buffered snapshot. Because the chunks are already in hand and flushed in the
+    // same batch as the respawn, the "downloading terrain" screen has no time to render.
+    Object msg;
+    while ((msg = buffered.poll()) != null) {
+      if (msg instanceof BundleDelimiterPacket) {
+        player.getBundleHandler().toggleBundleSession();
+      } else if (msg instanceof UpsertPlayerInfoPacket upsert) {
+        player.getTabList().processUpdate(upsert);
+      } else if (msg instanceof RemovePlayerInfoPacket remove) {
+        player.getTabList().processRemove(remove);
+      } else if (msg instanceof LegacyPlayerListItemPacket legacy) {
+        player.getTabList().processLegacy(legacy);
+      } else if (msg instanceof BossBarPacket bossBar) {
+        if (bossBar.getAction() == BossBarPacket.ADD) {
+          serverBossBars.add(bossBar.getUuid());
+        } else if (bossBar.getAction() == BossBarPacket.REMOVE) {
+          serverBossBars.remove(bossBar.getUuid());
+        }
+      } else if (msg instanceof AvailableCommandsPacket commands) {
+        // Proxy commands must be injected, matching the regular forwarding path. The packet is
+        // written asynchronously after the event; command trees are not world state, so arriving
+        // shortly after the snapshot flush is fine.
+        handleSeamlessAvailableCommands(commands);
+        continue;
+      }
+      clientConn.delayedWrite(msg);
+    }
+    clientConn.flush();
+
+    // TODO(seamless): the client keeps its old player entity id across the hot-swap, so target
+    // packets that refer to the player (or to a colliding id) by entity id are misapplied or
+    // dropped; a player-id rewrite would be needed to close this gap completely.
+    destination.setEntityId(joinGame.getEntityId());
+
+    // Tell the server about the proxy's and the client's plugin message channels, and flush any
+    // plugin messages queued during login.
+    final ProtocolVersion serverVersion = serverMc.getProtocolVersion();
+    final Collection<ChannelIdentifier> channels = server.getChannelRegistrar()
+        .getChannelsForProtocol(serverVersion);
+    if (!channels.isEmpty()) {
+      serverMc.delayedWrite(constructChannelsPacket(serverVersion, channels));
+    }
+    if (!player.getClientsideChannels().isEmpty()) {
+      serverMc.delayedWrite(constructChannelsPacket(serverVersion, player.getClientsideChannels()));
+    }
+    PluginMessagePacket pm;
+    while ((pm = loginPluginMessages.poll()) != null) {
+      serverMc.delayedWrite(pm);
+    }
+    loginPluginMessagesBytes.set(0);
+    loginPluginMessagesCount.set(0);
+    serverMc.flush();
+
+    destination.completeJoin();
+  }
+
+  /**
+   * Handles a buffered AvailableCommands packet during a seamless switch, mirroring the regular
+   * forwarding path in BackendPlaySessionHandler: proxy commands are injected and the
+   * {@link PlayerAvailableCommandsEvent} is fired before the packet reaches the client.
+   *
+   * @param commands the buffered command tree of the target server
+   */
+  private void handleSeamlessAvailableCommands(AvailableCommandsPacket commands) {
+    final RootCommandNode<CommandSource> rootNode = commands.getRootNode();
+    if (server.getConfiguration().isAnnounceProxyCommands()) {
+      server.getCommandManager().getInjector().inject(rootNode, player);
+      if (player.getConnection().getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_21_6)) {
+        rootNode.removeChildByName("velocity:callback");
+      }
+    }
+    server.getEventManager().fire(new PlayerAvailableCommandsEvent(player, rootNode))
+        .thenAcceptAsync(event -> player.getConnection().write(commands),
+            player.getConnection().eventLoop())
+        .exceptionally((ex) -> {
+          logger.error("Exception while handling available commands for {}", player, ex);
+          return null;
+        });
   }
 
   private void doSafeClientServerSwitch(JoinGamePacket joinGame) {

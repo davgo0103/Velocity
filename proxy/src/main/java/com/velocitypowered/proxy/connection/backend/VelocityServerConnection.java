@@ -50,8 +50,10 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -71,6 +73,7 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
   private boolean gracefulDisconnect = false;
   private BackendConnectionPhase connectionPhase = BackendConnectionPhases.UNKNOWN;
   private final Map<Long, Long> pendingPings = new HashMap<>();
+  private final Set<Integer> trackedEntityIds = new HashSet<>();
   private @MonotonicNonNull Integer entityId;
 
   /**
@@ -323,6 +326,17 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
 
   public Map<Long, Long> getPendingPings() {
     return pendingPings;
+  }
+
+  /**
+   * Entity ids this server has spawned on the client, tracked for seamless-transfer ghost
+   * cleanup. Only populated when entity tracking is configured; may over-approximate (ids the
+   * client already unloaded), which is harmless for the RemoveEntities cleanup it feeds.
+   *
+   * @return the mutable set of tracked entity ids
+   */
+  public Set<Integer> getTrackedEntityIds() {
+    return trackedEntityIds;
   }
 
   public Integer getEntityId() {

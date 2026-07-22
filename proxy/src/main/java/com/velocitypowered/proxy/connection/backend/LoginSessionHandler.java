@@ -158,17 +158,31 @@ public class LoginSessionHandler implements MinecraftSessionHandler {
       smc.setActiveSessionHandler(StateRegistry.PLAY, new TransitionSessionHandler(server, serverConn, resultFuture));
     } else {
       smc.write(new LoginAcknowledgedPacket());
-      smc.setActiveSessionHandler(StateRegistry.CONFIG, new ConfigSessionHandler(server, serverConn, resultFuture));
       ConnectedPlayer player = serverConn.getPlayer();
-      if (player.getClientSettingsPacket() != null) {
-        smc.write(player.getClientSettingsPacket());
-      }
-      if (player.getConnection().getActiveSessionHandler() instanceof ClientPlaySessionHandler clientPlaySessionHandler) {
-        smc.setAutoReading(false);
-        clientPlaySessionHandler.doSwitch().thenRunAsync(() -> smc.setAutoReading(true), smc.eventLoop());
+      if (player.getConnection().getActiveSessionHandler() instanceof ClientPlaySessionHandler
+          && SeamlessSwitchController.isEligible(server, player, serverConn)) {
+        // Seamless transfer: the client stays in PLAY on its current server while the proxy
+        // answers the configuration phase itself and buffers the new server's world snapshot.
+        SeamlessSwitchController controller =
+            new SeamlessSwitchController(server, player, serverConn, resultFuture);
+        player.setSeamlessSwitchController(controller);
+        smc.setActiveSessionHandler(StateRegistry.CONFIG,
+            new SeamlessConfigSessionHandler(server, serverConn, resultFuture, controller));
+        if (player.getClientSettingsPacket() != null) {
+          smc.write(player.getClientSettingsPacket());
+        }
       } else {
-        // Initial login - the player is already in configuration state.
-        server.getEventManager().fireAndForget(new PlayerEnteredConfigurationEvent(player, serverConn));
+        smc.setActiveSessionHandler(StateRegistry.CONFIG, new ConfigSessionHandler(server, serverConn, resultFuture));
+        if (player.getClientSettingsPacket() != null) {
+          smc.write(player.getClientSettingsPacket());
+        }
+        if (player.getConnection().getActiveSessionHandler() instanceof ClientPlaySessionHandler clientPlaySessionHandler) {
+          smc.setAutoReading(false);
+          clientPlaySessionHandler.doSwitch().thenRunAsync(() -> smc.setAutoReading(true), smc.eventLoop());
+        } else {
+          // Initial login - the player is already in configuration state.
+          server.getEventManager().fireAndForget(new PlayerEnteredConfigurationEvent(player, serverConn));
+        }
       }
     }
 

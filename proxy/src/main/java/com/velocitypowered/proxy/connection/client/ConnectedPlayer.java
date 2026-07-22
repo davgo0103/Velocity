@@ -61,6 +61,7 @@ import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.adventure.VelocityBossBarImplementation;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.MinecraftConnectionAssociation;
+import com.velocitypowered.proxy.connection.backend.SeamlessSwitchController;
 import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.connection.player.bossbar.BossBarManager;
 import com.velocitypowered.proxy.connection.player.bundle.BundleDelimiterHandler;
@@ -179,6 +180,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   private final boolean onlineMode;
   private @Nullable VelocityServerConnection connectedServer;
   private @Nullable VelocityServerConnection connectionInFlight;
+  private @Nullable SeamlessSwitchController seamlessSwitchController;
   private @Nullable PlayerSettings settings;
   private @Nullable ModInfo modInfo;
   private final Set<VelocityBossBarImplementation> bossBars = new HashSet<>();
@@ -1421,6 +1423,30 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
 
   public BossBarManager getBossBarManager() {
     return bossBarManager;
+  }
+
+  /**
+   * Returns the seamless switch controller of the in-flight seamless transfer, if any.
+   *
+   * @return the active controller, or null
+   */
+  public @Nullable SeamlessSwitchController getSeamlessSwitchController() {
+    return seamlessSwitchController;
+  }
+
+  public void setSeamlessSwitchController(SeamlessSwitchController controller) {
+    this.seamlessSwitchController = controller;
+  }
+
+  /**
+   * Clears the seamless switch controller if it is still the given one.
+   *
+   * @param controller the controller that finished or aborted
+   */
+  public void clearSeamlessSwitchController(SeamlessSwitchController controller) {
+    if (this.seamlessSwitchController == controller) {
+      this.seamlessSwitchController = null;
+    }
   }
 
   private final class ConnectionRequestBuilderImpl implements ConnectionRequestBuilder {

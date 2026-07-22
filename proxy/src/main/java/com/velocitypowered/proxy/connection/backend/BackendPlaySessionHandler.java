@@ -45,6 +45,7 @@ import com.velocitypowered.proxy.connection.player.resourcepack.VelocityResource
 import com.velocitypowered.proxy.connection.player.resourcepack.handler.ResourcePackHandler;
 import com.velocitypowered.proxy.connection.util.ConnectionMessages;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
+import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftVarintFrameDecoder;
@@ -94,11 +95,19 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
       Integer.getInteger("velocity.max-packets-per-flush", 8192);
   private static final int LARGE_PACKET_THRESHOLD = 1024 * 128;
 
+  // Safety cap so a misbehaving backend cannot grow the set without bound. A player realistically
+  // sees at most a few thousand entities within render distance, so 16384 is a generous ceiling
+  // that keeps the (boxed) set's worst-case memory small.
+  private static final int MAX_TRACKED_ENTITY_IDS = 1 << 14;
+
   private final VelocityServer server;
   private final VelocityServerConnection serverConn;
   private final ClientPlaySessionHandler playerSessionHandler;
   private final MinecraftConnection playerConnection;
   private final BungeeCordMessageResponder bungeecordMessageResponder;
+  private final boolean trackEntityIds;
+  private final int addEntityPacketId;
+  private final int removeEntitiesPacketId;
   private boolean exceptionTriggered = false;
   private int packetsFlushed;
 
@@ -106,6 +115,11 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
     this.server = server;
     this.serverConn = serverConn;
     this.playerConnection = serverConn.getPlayer().getConnection();
+
+    final var seamlessConfig = server.getConfiguration().getSeamlessTransfersConfig();
+    this.trackEntityIds = seamlessConfig.entityTrackingEnabled();
+    this.addEntityPacketId = seamlessConfig.addEntityPacketId();
+    this.removeEntitiesPacketId = seamlessConfig.removeEntitiesPacketId();
 
     MinecraftSessionHandler psh = playerConnection.getActiveSessionHandler();
     if (!(psh instanceof ClientPlaySessionHandler)) {
@@ -149,6 +163,16 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(StartUpdatePacket packet) {
+    // If the current server re-enters configuration while a seamless transfer is being prepared,
+    // the transfer cannot continue: the client is about to be reset. Abort it; the connection
+    // request completes unsuccessfully and the player simply follows the reconfiguration.
+    final SeamlessSwitchController seamlessController =
+        serverConn.getPlayer().getSeamlessSwitchController();
+    if (seamlessController != null) {
+      seamlessController.abort(null, null);
+    }
+    // The configuration state resets the client's entities; the tracked ids are obsolete.
+    serverConn.getTrackedEntityIds().clear();
     MinecraftConnection smc = serverConn.ensureConnected();
     smc.setAutoReading(false);
     // Even when not auto reading messages are still decoded. Decode them with the correct state
@@ -179,12 +203,12 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(BossBarPacket packet) {
-    if (serverConn.getPlayer().getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
-      if (packet.getAction() == BossBarPacket.ADD) {
-        playerSessionHandler.getServerBossBars().add(packet.getUuid());
-      } else if (packet.getAction() == BossBarPacket.REMOVE) {
-        playerSessionHandler.getServerBossBars().remove(packet.getUuid());
-      }
+    // Tracked for all versions: pre-1.20.2 clients need explicit removal on a regular switch,
+    // and seamless (PLAY-state) switches need it on 1.20.2+ as well.
+    if (packet.getAction() == BossBarPacket.ADD) {
+      playerSessionHandler.getServerBossBars().add(packet.getUuid());
+    } else if (packet.getAction() == BossBarPacket.REMOVE) {
+      playerSessionHandler.getServerBossBars().remove(packet.getUuid());
     }
     return false; // forward
   }
@@ -467,12 +491,71 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
+    if (trackEntityIds) {
+      trackEntityIds(buf);
+    }
     boolean huge = buf.readableBytes() > LARGE_PACKET_THRESHOLD;
     playerConnection.delayedWrite(buf.retain());
     if (huge || ++packetsFlushed >= MAXIMUM_PACKETS_TO_FLUSH) {
       playerConnection.flush();
       packetsFlushed = 0;
     }
+  }
+
+  /**
+   * Tracks the entity ids this server spawns on the client, so a seamless transfer can remove
+   * the leftovers ("ghosts") when the client's level is reused across the switch. Parses only
+   * the leading varints of Spawn Entity / Remove Entities packets; ids are configured in
+   * [seamless-transfers] since they vary by protocol version.
+   *
+   * <p>Runs on the hot backend→client passthrough path, so the packet id is peeked without
+   * allocating and the vast majority of packets (which are neither Spawn Entity nor Remove
+   * Entities) return before touching the ByteBuf reader index.</p>
+   */
+  private void trackEntityIds(ByteBuf buf) {
+    final int packetId = peekVarInt(buf, buf.readerIndex());
+    if (packetId != addEntityPacketId && packetId != removeEntitiesPacketId) {
+      return;
+    }
+    try {
+      final ByteBuf peek = buf.duplicate();
+      ProtocolUtils.readVarInt(peek); // skip the packet id
+      final var tracked = serverConn.getTrackedEntityIds();
+      if (packetId == addEntityPacketId) {
+        if (tracked.size() < MAX_TRACKED_ENTITY_IDS) {
+          tracked.add(ProtocolUtils.readVarInt(peek));
+        }
+      } else {
+        final int count = Math.min(ProtocolUtils.readVarInt(peek), MAX_TRACKED_ENTITY_IDS);
+        for (int i = 0; i < count && peek.isReadable(); i++) {
+          tracked.remove(ProtocolUtils.readVarInt(peek));
+        }
+      }
+    } catch (Exception e) {
+      // Malformed or truncated varints: ignore, tracking is best-effort.
+    }
+  }
+
+  /**
+   * Reads a varint at the given absolute index without moving the reader index or allocating.
+   *
+   * @param buf   the buffer to read from
+   * @param index the absolute index of the varint's first byte
+   * @return the decoded value, or -1 if it is truncated or longer than 3 bytes
+   */
+  private static int peekVarInt(ByteBuf buf, int index) {
+    int result = 0;
+    for (int i = 0; i < 3; i++) {
+      if (buf.writerIndex() <= index + i) {
+        return -1;
+      }
+      final byte read = buf.getByte(index + i);
+      result |= (read & 0x7F) << (7 * i);
+      if ((read & 0x80) == 0) {
+        return result;
+      }
+    }
+    return -1;
   }
 
   @Override
