@@ -334,6 +334,8 @@ public final class SeamlessSwitchController {
 
           playHandler.doSeamlessSwitch(targetJoinGame, target, buffer);
 
+          // Resume normal packet dispatch on the target: from here it is a fully live backend.
+          smc.interceptingPackets = false;
           smc.setActiveSessionHandler(StateRegistry.PLAY,
               new BackendPlaySessionHandler(server, target));
           player.setConnectedServer(target);
@@ -477,8 +479,20 @@ public final class SeamlessSwitchController {
     }
 
     @Override
-    public void handleGeneric(MinecraftPacket packet) {
+    public void activated() {
+      // Intercept before handle(), so any decoded packet still in flight from the frozen source
+      // (e.g. a plugin-hooked packet expecting a BackendPlaySessionHandler) is dropped rather
+      // than dispatched.
+      final MinecraftConnection conn = source.getConnection();
+      if (conn != null) {
+        conn.interceptingPackets = true;
+      }
+    }
+
+    @Override
+    public boolean intercept(MinecraftPacket packet) {
       controller.onSourcePacketDropped();
+      return true;
     }
 
     @Override

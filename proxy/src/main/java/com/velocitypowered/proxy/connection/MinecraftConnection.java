@@ -89,6 +89,10 @@ public class MinecraftConnection extends ChannelInboundHandlerAdapter {
 
   private final Channel channel;
   public boolean pendingConfigurationSwitch = false;
+  // When set, decoded packets are offered to the active handler's intercept() before their own
+  // handle() runs. Used by seamless transfers so a target server's packets are buffered as data
+  // without executing any per-packet logic (including third-party plugin packet hooks).
+  public boolean interceptingPackets = false;
   private SocketAddress remoteAddress;
   private StateRegistry state;
   private Map<StateRegistry, MinecraftSessionHandler> sessionHandlers;
@@ -155,6 +159,11 @@ public class MinecraftConnection extends ChannelInboundHandlerAdapter {
       }
 
       if (msg instanceof MinecraftPacket pkt) {
+        if (interceptingPackets && activeSessionHandler.intercept(pkt)) {
+          // Consumed by the interceptor (e.g. buffered during a seamless transfer); skip the
+          // packet's own handle() so no per-packet logic runs.
+          return;
+        }
         if (!pkt.handle(activeSessionHandler)) {
           activeSessionHandler.handleGeneric(pkt);
         }

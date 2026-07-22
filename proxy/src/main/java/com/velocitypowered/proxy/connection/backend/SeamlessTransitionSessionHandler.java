@@ -49,6 +49,14 @@ public class SeamlessTransitionSessionHandler implements MinecraftSessionHandler
   }
 
   @Override
+  public void activated() {
+    // Route every decoded packet through intercept() below instead of its own handle(), so a
+    // decoded packet's per-packet logic (including third-party plugin hooks that assume the
+    // backend handler is a BackendPlaySessionHandler) never runs while we are buffering.
+    serverConn.ensureConnected().interceptingPackets = true;
+  }
+
+  @Override
   public boolean beforeHandle() {
     if (!serverConn.isActive()) {
       // Obsolete connection
@@ -59,37 +67,28 @@ public class SeamlessTransitionSessionHandler implements MinecraftSessionHandler
   }
 
   @Override
-  public boolean handle(KeepAlivePacket packet) {
-    // The client does not see the target server yet, so the proxy answers on its behalf.
-    serverConn.ensureConnected().write(packet);
-    return true;
-  }
-
-  @Override
-  public boolean handle(JoinGamePacket packet) {
-    controller.onTargetJoinGame(packet);
-    return true;
-  }
-
-  @Override
-  public boolean handle(DisconnectPacket packet) {
-    serverConn.disconnect();
-    controller.abort(ConnectionRequestResults.forDisconnect(packet, serverConn.getServer()), null);
-    return true;
-  }
-
-  @Override
-  public boolean handle(PluginMessagePacket packet) {
-    if (bungeecordMessageResponder.process(packet)) {
+  public boolean intercept(MinecraftPacket packet) {
+    if (packet instanceof JoinGamePacket joinGame) {
+      controller.onTargetJoinGame(joinGame);
+      return true;
+    }
+    if (packet instanceof KeepAlivePacket keepAlive) {
+      // The client does not see the target server yet, so the proxy answers on its behalf.
+      serverConn.ensureConnected().write(keepAlive);
+      return true;
+    }
+    if (packet instanceof DisconnectPacket disconnect) {
+      serverConn.disconnect();
+      controller.abort(
+          ConnectionRequestResults.forDisconnect(disconnect, serverConn.getServer()), null);
+      return true;
+    }
+    if (packet instanceof PluginMessagePacket pluginMessage
+        && bungeecordMessageResponder.process(pluginMessage)) {
       return true;
     }
     controller.bufferPacket(packet);
     return true;
-  }
-
-  @Override
-  public void handleGeneric(MinecraftPacket packet) {
-    controller.bufferPacket(packet);
   }
 
   @Override

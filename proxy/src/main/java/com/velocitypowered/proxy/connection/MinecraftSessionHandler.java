@@ -104,6 +104,21 @@ public interface MinecraftSessionHandler {
 
   }
 
+  /**
+   * Intercepts a decoded packet before its {@link MinecraftPacket#handle} is invoked. Only
+   * consulted when {@link MinecraftConnection#interceptingPackets} is set. Returning true takes
+   * full ownership of the packet (the normal {@code packet.handle(handler)} dispatch is skipped),
+   * which lets a handler capture raw packets without running any per-packet logic that decoded
+   * packets may carry — used by seamless transfers to buffer a target server's stream without
+   * triggering plugin packet hooks mid-switch.
+   *
+   * @param packet the decoded packet
+   * @return true if the packet was consumed and normal dispatch should be skipped
+   */
+  default boolean intercept(MinecraftPacket packet) {
+    return false;
+  }
+
   default void connected() {
 
   }
