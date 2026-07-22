@@ -118,11 +118,11 @@ public final class SeamlessSwitchController {
     this.target = target;
     this.resultFuture = resultFuture;
     this.config = server.getConfiguration().getSeamlessTransfersConfig();
-    if (!config.entityTrackingEnabled()) {
-      logger.warn("Seamless transfer for {}: add-entity-packet-id / remove-entities-packet-id "
-              + "are not configured; the previous server's entities cannot be cleaned up and "
-              + "will linger as ghosts (risking entity id collisions)",
-          player.getUsername());
+    if (!SeamlessEntityPackets.supported(player.getProtocolVersion())) {
+      logger.warn("Seamless transfer for {}: entity packet ids are not known for {}; the "
+              + "previous server's entities cannot be cleaned up and will linger as ghosts "
+              + "(add the version to SeamlessEntityPackets to enable cleanup)",
+          player.getUsername(), player.getProtocolVersion());
     }
     this.prepareTimeoutTask = player.getConnection().eventLoop().schedule(this::onPrepareTimeout,
         config.prepareTimeoutMs(), TimeUnit.MILLISECONDS);

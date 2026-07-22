@@ -1033,30 +1033,14 @@ public class VelocityConfiguration implements ProxyConfig {
    *                               version-independent snapshot-completion heuristic
    * @param commitChunkPackets     commit as soon as this many chunk-sized packets have been
    *                               buffered; servers send chunks closest to the player first
-   * @param addEntityPacketId      clientbound packet id (decimal) of "Spawn Entity" for the
-   *                               protocol version in use; enables ghost-entity tracking.
-   *                               -1 disables tracking
-   * @param removeEntitiesPacketId clientbound packet id (decimal) of "Remove Entities" for
-   *                               the protocol version in use; -1 disables ghost cleanup
    * @param verbose                whether to log the packet timeline of every seamless switch
    */
   public record SeamlessTransfersConfig(boolean enabled, List<List<String>> serverGroups,
                                         int commitGraceMs, int commitTimeoutMs,
                                         int prepareTimeoutMs, int chunkPacketMinBytes,
-                                        int commitChunkPackets, int addEntityPacketId,
-                                        int removeEntitiesPacketId, boolean verbose) {
+                                        int commitChunkPackets, boolean verbose) {
     public static final SeamlessTransfersConfig DEFAULT =
-        new SeamlessTransfersConfig(false, List.of(), 150, 2000, 5000, 4096, 25, -1, -1, false);
-
-    /**
-     * Whether ghost-entity tracking (needed to clean up the previous server's entities at the
-     * swap) is fully configured.
-     *
-     * @return true if both entity packet ids are set
-     */
-    public boolean entityTrackingEnabled() {
-      return enabled && addEntityPacketId >= 0 && removeEntitiesPacketId >= 0;
-    }
+        new SeamlessTransfersConfig(false, List.of(), 150, 2000, 5000, 4096, 25, false);
 
     /**
      * Returns a SeamlessTransfersConfig from a config section, or the default if the section
@@ -1078,8 +1062,6 @@ public class VelocityConfiguration implements ProxyConfig {
           config.getIntOrElse("prepare-timeout-ms", DEFAULT.prepareTimeoutMs()),
           config.getIntOrElse("chunk-packet-min-bytes", DEFAULT.chunkPacketMinBytes()),
           config.getIntOrElse("commit-chunk-packets", DEFAULT.commitChunkPackets()),
-          config.getIntOrElse("add-entity-packet-id", DEFAULT.addEntityPacketId()),
-          config.getIntOrElse("remove-entities-packet-id", DEFAULT.removeEntitiesPacketId()),
           config.getOrElse("verbose", DEFAULT.verbose())
       );
     }

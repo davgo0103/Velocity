@@ -39,6 +39,7 @@ import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
 import com.velocitypowered.proxy.connection.backend.BackendConnectionPhases;
 import com.velocitypowered.proxy.connection.backend.BungeeCordMessageResponder;
+import com.velocitypowered.proxy.connection.backend.SeamlessEntityPackets;
 import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.connection.forge.legacy.LegacyForgeConstants;
 import com.velocitypowered.proxy.connection.player.resourcepack.ResourcePackResponseBundle;
@@ -773,12 +774,12 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     // server's entities survive and are removed explicitly (when entity tracking is
     // configured); the player also keeps its old entity id (see TODO below).
     final VelocityServerConnection previous = player.getConnectedServer();
-    final var seamlessConfig = server.getConfiguration().getSeamlessTransfersConfig();
-    if (previous != null && seamlessConfig.removeEntitiesPacketId() >= 0) {
+    final int removeEntitiesId = SeamlessEntityPackets.removeEntitiesId(player.getProtocolVersion());
+    if (previous != null && removeEntitiesId >= 0) {
       final var ghosts = previous.getTrackedEntityIds();
       if (!ghosts.isEmpty()) {
         final ByteBuf removeGhosts = Unpooled.buffer();
-        ProtocolUtils.writeVarInt(removeGhosts, seamlessConfig.removeEntitiesPacketId());
+        ProtocolUtils.writeVarInt(removeGhosts, removeEntitiesId);
         ProtocolUtils.writeVarInt(removeGhosts, ghosts.size());
         for (int ghostId : ghosts) {
           ProtocolUtils.writeVarInt(removeGhosts, ghostId);

@@ -116,10 +116,14 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
     this.serverConn = serverConn;
     this.playerConnection = serverConn.getPlayer().getConnection();
 
-    final var seamlessConfig = server.getConfiguration().getSeamlessTransfersConfig();
-    this.trackEntityIds = seamlessConfig.entityTrackingEnabled();
-    this.addEntityPacketId = seamlessConfig.addEntityPacketId();
-    this.removeEntitiesPacketId = seamlessConfig.removeEntitiesPacketId();
+    // Entity packet ids are selected automatically from the connection's protocol version, so
+    // ghost cleanup needs no per-server configuration; it is simply skipped on versions whose
+    // ids are not yet in the table.
+    final ProtocolVersion version = serverConn.getPlayer().getProtocolVersion();
+    this.addEntityPacketId = SeamlessEntityPackets.addEntityId(version);
+    this.removeEntitiesPacketId = SeamlessEntityPackets.removeEntitiesId(version);
+    this.trackEntityIds = server.getConfiguration().getSeamlessTransfersConfig().enabled()
+        && SeamlessEntityPackets.supported(version);
 
     MinecraftSessionHandler psh = playerConnection.getActiveSessionHandler();
     if (!(psh instanceof ClientPlaySessionHandler)) {

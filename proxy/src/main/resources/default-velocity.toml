@@ -218,13 +218,6 @@ enabled = false
 # Example: server-groups = [ ["lobby", "survival"], ["mini1", "mini2"] ]
 server-groups = []
 
-# Clientbound packet ids (decimal) of "Spawn Entity" and "Remove Entities" for the protocol
-# version your players use, from the protocol documentation (e.g. minecraft.wiki). Required so
-# the previous server's entities can be removed at the swap; without them they linger as ghosts
-# and their ids may collide with the new server's (client crashes). -1 disables cleanup.
-add-entity-packet-id = -1
-remove-entities-packet-id = -1
-
 # Commit as soon as this many chunk-sized packets have been buffered. Servers send the chunks
 # closest to the player first, so the area around the player refreshes before the swap; the
 # remaining chunks continue streaming normally afterwards. Roughly (2r+1)^2 for a radius r.
