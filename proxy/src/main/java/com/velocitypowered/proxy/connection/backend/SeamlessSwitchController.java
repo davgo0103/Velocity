@@ -85,6 +85,7 @@ public final class SeamlessSwitchController {
   private final VelocityServerConnection target;
   private final CompletableFuture<Impl> resultFuture;
   private final SeamlessTransfersConfig config;
+  private final int chunkBatchFinishedId;
 
   private State state = State.PREPARING;
   private final ArrayDeque<Object> buffer = new ArrayDeque<>();
@@ -118,10 +119,11 @@ public final class SeamlessSwitchController {
     this.target = target;
     this.resultFuture = resultFuture;
     this.config = server.getConfiguration().getSeamlessTransfersConfig();
-    if (!SeamlessEntityPackets.supported(player.getProtocolVersion())) {
+    this.chunkBatchFinishedId = SeamlessPacketIds.chunkBatchFinishedId(player.getProtocolVersion());
+    if (!SeamlessPacketIds.entityCleanupSupported(player.getProtocolVersion())) {
       logger.warn("Seamless transfer for {}: entity packet ids are not known for {}; the "
               + "previous server's entities cannot be cleaned up and will linger as ghosts "
-              + "(add the version to SeamlessEntityPackets to enable cleanup)",
+              + "(add the version to SeamlessPacketIds to enable cleanup)",
           player.getUsername(), player.getProtocolVersion());
     }
     this.prepareTimeoutTask = player.getConnection().eventLoop().schedule(this::onPrepareTimeout,
@@ -236,17 +238,21 @@ public final class SeamlessSwitchController {
       // Already committing; just collect for the flush.
       return;
     }
+    // Primary trigger: the server sends "Chunk Batch Finished" once it has streamed a batch of
+    // initial chunks. The first batch contains the chunks nearest the player, so committing here
+    // means the client's surroundings — and the earlier, now-suppressed load-screen event — are
+    // all in the buffer. This is independent of how large the chunk packets compress to, which
+    // the size heuristic below is not.
+    if (chunkBatchFinishedId >= 0 && peekVarInt(buf) == chunkBatchFinishedId) {
+      commit("chunk-batch");
+      return;
+    }
     if (buf.readableBytes() >= config.chunkPacketMinBytes()) {
-      // Chunk data is orders of magnitude larger than the steady tick traffic (time updates,
-      // entity movement). Tracking only these packets gives a version-independent signal,
-      // which the all-packet quiet window cannot provide on a live server that never goes
-      // quiet.
+      // Fallback for versions without a known Chunk Batch Finished id: chunk data is far larger
+      // than the steady tick traffic (time updates, entity movement), so a quiet window on these
+      // large packets approximates "the initial chunks have stopped arriving".
       chunkSizedPacketsSeen++;
       lastChunkPacketNanos = System.nanoTime();
-      // Servers stream chunks closest to the player first, so the area that hides the loading
-      // screen arrives early; the rest keeps flowing after the swap through the regular
-      // forwarding path. Committing at a fixed chunk budget beats waiting for the whole
-      // (batch-throttled) stream to end.
       if (config.commitChunkPackets() > 0
           && chunkSizedPacketsSeen >= config.commitChunkPackets()) {
         commit("chunks");
@@ -460,6 +466,28 @@ public final class SeamlessSwitchController {
       return false;
     }
     return buf.getInt(readerIndex + idLength + 1) == 0;
+  }
+
+  /**
+   * Reads the leading varint (packet id) of a raw packet without consuming it.
+   *
+   * @param buf the raw packet, readerIndex at the packet id
+   * @return the packet id, or -1 if it could not be read within 3 bytes
+   */
+  private static int peekVarInt(ByteBuf buf) {
+    final int readerIndex = buf.readerIndex();
+    int result = 0;
+    for (int i = 0; i < 3; i++) {
+      if (buf.writerIndex() <= readerIndex + i) {
+        return -1;
+      }
+      final byte read = buf.getByte(readerIndex + i);
+      result |= (read & 0x7F) << (7 * i);
+      if ((read & 0x80) == 0) {
+        return result;
+      }
+    }
+    return -1;
   }
 
   /**

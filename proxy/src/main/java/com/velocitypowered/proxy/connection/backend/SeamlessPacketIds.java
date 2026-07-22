@@ -20,23 +20,27 @@ package com.velocitypowered.proxy.connection.backend;
 import com.velocitypowered.api.network.ProtocolVersion;
 
 /**
- * Per-protocol-version packet ids for the two clientbound entity packets a seamless transfer
- * needs: "Spawn Entity" (to track which entities the source server has shown the client) and
- * "Remove Entities" (to clear those entities at the swap, since a hot-swap reuses the client's
- * level). Velocity does not otherwise decode these packets, so the ids are kept here rather than
- * in the protocol StateRegistry.
+ * Per-protocol-version clientbound packet ids that seamless transfers need but Velocity does not
+ * otherwise decode.
  *
- * <p>The client and backend connections always share a protocol version in Velocity, so the id
- * is selected automatically from the connection's version — no per-server configuration is
- * needed. Values are taken from ViaVersion's {@code ClientboundPackets*} enums (verified against
- * the {@code // 0xNN} id comments in those files). When a new Minecraft version is supported,
- * add its id below; an unknown version returns -1, which safely disables entity cleanup for that
- * version (leftover entities linger until the target server's own packets overwrite them, but
- * nothing breaks).</p>
+ * <ul>
+ *   <li>"Spawn Entity" and "Remove Entities" — to track the source server's entities and clear
+ *       them at the swap, since a hot-swap reuses the client's level.</li>
+ *   <li>"Chunk Batch Finished" — the marker the server sends when it has finished a batch of
+ *       initial chunks, used as the commit trigger so the swap happens once the player's
+ *       surroundings have arrived (independent of chunk packet sizes).</li>
+ * </ul>
+ *
+ * <p>The client and backend connections always share a protocol version in Velocity, so ids are
+ * selected automatically from the connection's version — no per-server configuration is needed.
+ * Values are taken from ViaVersion's {@code ClientboundPackets*} enums (verified against the
+ * {@code // 0xNN} id comments in those files). When a new Minecraft version is supported, add its
+ * ids below; an unknown version returns -1, which the callers treat as "feature unavailable on
+ * this version" (falling back to heuristics, or skipping entity cleanup) rather than failing.</p>
  */
-public final class SeamlessEntityPackets {
+public final class SeamlessPacketIds {
 
-  private SeamlessEntityPackets() {
+  private SeamlessPacketIds() {
   }
 
   /**
@@ -69,12 +73,28 @@ public final class SeamlessEntityPackets {
   }
 
   /**
+   * The clientbound "Chunk Batch Finished" packet id for the given protocol version.
+   *
+   * @param version the connection's protocol version
+   * @return the packet id, or -1 if the version is not in the table
+   */
+  public static int chunkBatchFinishedId(ProtocolVersion version) {
+    return switch (version) {
+      case MINECRAFT_1_20_2, MINECRAFT_1_20_3, MINECRAFT_1_20_5,
+           MINECRAFT_1_21, MINECRAFT_1_21_2, MINECRAFT_1_21_4 -> 0x0C;
+      case MINECRAFT_1_21_5, MINECRAFT_1_21_6, MINECRAFT_1_21_7,
+           MINECRAFT_1_21_9, MINECRAFT_1_21_11, MINECRAFT_26_1, MINECRAFT_26_2 -> 0x0B;
+      default -> -1;
+    };
+  }
+
+  /**
    * Whether both entity packet ids are known for the given version, i.e. entity cleanup can run.
    *
    * @param version the connection's protocol version
    * @return true if cleanup is supported on this version
    */
-  public static boolean supported(ProtocolVersion version) {
+  public static boolean entityCleanupSupported(ProtocolVersion version) {
     return addEntityId(version) >= 0 && removeEntitiesId(version) >= 0;
   }
 }
