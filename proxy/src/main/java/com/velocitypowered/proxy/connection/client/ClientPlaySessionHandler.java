@@ -752,8 +752,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       clientConn.delayedWrite(BundleDelimiterPacket.INSTANCE);
     }
 
-    // Clear UI leftovers of the previous server. A same-dimension respawn only resets the world
-    // and entities; HUD state must be removed explicitly.
+    // Clear UI leftovers of the previous server. No world-switch packet is sent, so nothing
+    // resets the client's HUD state — the tab list, header/footer, boss bars and title carried
+    // over from the previous server must be removed explicitly.
     player.getTabList().clearAll();
     player.clearPlayerListHeaderAndFooter();
     for (UUID serverBossBar : serverBossBars) {
@@ -788,8 +789,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       }
     }
 
-    // Stream the buffered snapshot. Because the chunks are already in hand and flushed in the
-    // same batch as the respawn, the "downloading terrain" screen has no time to render.
+    // Stream the buffered snapshot to the client. The client keeps its rendered world; these
+    // packets (position, chunks, entity spawns, inventory, ...) update it in place.
     Object msg;
     while ((msg = buffered.poll()) != null) {
       if (msg instanceof BundleDelimiterPacket) {

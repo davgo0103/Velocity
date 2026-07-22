@@ -205,12 +205,15 @@ show-plugins = false
 
 [seamless-transfers]
 # EXPERIMENTAL: keep players in the PLAY state when switching between backend servers of the
-# same group. The proxy answers the new server's configuration phase itself, buffers its
-# initial world snapshot and hot-swaps the backend without sending the client any world-switch
-# packet, so no loading screen appears. Both servers of a group MUST share the same world
-# template (dimension types, world names) and the same player data (position, inventory,
-# health), e.g. via a player-data synchronization plugin. If those preconditions do not hold,
-# leave this disabled.
+# same group, avoiding the "loading terrain" screen. The proxy answers the new server's
+# configuration phase itself and swaps the backend without sending the client any world-switch
+# packet, so the client keeps its rendered world; the new server's "start waiting for chunks"
+# event then resolves on the next frame because the player is already at that (synchronized)
+# position with the chunk loaded. Both servers of a group MUST share the same world template
+# (dimension types, world names) AND synchronize player data INCLUDING the exact position (e.g.
+# via a player-data sync plugin) — if the position differs at all, the client must genuinely
+# load new terrain and the screen cannot be hidden. If those preconditions do not hold, leave
+# this disabled.
 enabled = false
 
 # Groups of servers that share a world template and player data. Seamless transfers only

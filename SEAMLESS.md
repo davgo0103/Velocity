@@ -1,16 +1,26 @@
 # Seamless Server Transfers(無縫換伺服器)
 
-本 fork 讓玩家在「同世界模板」的後端之間切換時**完全沒有載入畫面**:
-不回伺服器列表、不重連、不進 config 階段、不出現「正在載入地形」。
+本 fork 讓玩家在**同一份世界的分流後端**之間切換時,**看不到「正在載入地形」畫面**:
+不回伺服器列表、不重連、不進 config 階段、視角直接維持。
 
-原理:proxy 代替客戶端回答新伺服器的 config 階段、緩衝其初始世界快照,
-然後**不送任何世界切換封包**直接換手(hot-swap)——因為兩邊世界相同,
-畫面上的地形本來就是對的,新伺服器的位置同步、區塊、實體直接接管。
+## 原理
 
-## 前提條件
+1. proxy 代替客戶端回答目標伺服器的 **config 階段**(客戶端全程留在 PLAY,繼續在來源伺服器遊玩)。
+2. 緩衝目標伺服器的初始封包。
+3. 換手(commit)時:清掉來源伺服器的實體(避免殘留)、tab / boss bar / title,
+   再把緩衝的封包一次送給客戶端。**不送 JoinGame / Respawn**,所以客戶端保留現有的世界畫面。
+4. 目標伺服器的「開始等待區塊」事件**照常轉發**——關鍵在這裡:因為 **playerdata 同步讓玩家
+   停在完全相同的座標**,客戶端腳下的區塊本來就載入好了,所以那個「等待區塊」在下一幀就
+   自我了結,你根本看不到畫面。
+
+> **注意**:早期版本嘗試「抑制」這個事件,結果讓客戶端卡在載入畫面(1.21+)。
+> 正解是**不要抑制、讓同步好的位置自然關閉它**。這也是為什麼位置同步是硬性前提。
+
+## 前提條件(缺一不可)
 
 1. 同一組(group)內的伺服器**共用同一份世界模板**(維度、世界名稱一致)。
-2. **玩家資料同步**(位置、血量、背包),例如 playerdata 同步插件。
+2. **玩家資料同步,且包含精確座標**(例如 Paper 的 playerdata 同步插件)。
+   這是無縫的核心——**位置只要有落差,客戶端就得真的載入新地形,畫面就無法消除**。
 3. 客戶端為 vanilla **1.20.2+**(不符合的玩家自動走原生切換,不會壞)。
 4. Velocity modern forwarding 照常設定。
 
@@ -19,23 +29,15 @@
 ```toml
 [seamless-transfers]
 enabled = true
-server-groups = [ ["SRV1", "SRV2"] ]   # 填 [servers] 裡的名稱;只有同組互切才無縫
-
-# 後端版本的兩個封包 id(十進位),查 minecraft.wiki 的 Protocol 頁。
-# Minecraft 26.2:Spawn Entity = 0x01 → 1,Remove Entities = 0x4D → 77
-# 沒填(-1)時舊伺服器的實體會殘留(ghost),並有 id 衝突使客戶端 crash 的風險。
-add-entity-packet-id = 1
-remove-entities-packet-id = 77
-
-verbose = true                          # 印出每次切換的時間軸,調參用
+server-groups = [ ["TW-0", "TW-1", "TW-2"] ]   # 填 [servers] 裡的名稱;只有同組互切才無縫
+verbose = false                                 # 需要調參 / 觀察時間軸時設 true
 ```
 
-進階選項(通常不用動):`commit-chunk-packets = 25`(收到幾個區塊就換手)、
-`chunk-packet-min-bytes = 4096`(多大算區塊封包)、`commit-grace-ms = 150`(安靜視窗)、
-`commit-timeout-ms = 2000`(強制換手上限)、`prepare-timeout-ms = 5000`(準備逾時)。
+就這樣——**不需要設定任何封包 id**。實體清理需要的封包 id 會依每條連線的協定版本
+自動選擇(內建對照表,涵蓋 1.20.2 ~ 26.2)。
 
-> 這兩個封包 id 綁定**後端版本**,與玩家客戶端版本無關;
-> 只有升級後端 Minecraft 版本時才需要重查更新。
+進階選項(通常不用動):`commit-chunk-packets = 25`、`chunk-packet-min-bytes = 4096`、
+`commit-grace-ms = 150`、`commit-timeout-ms = 2000`、`prepare-timeout-ms = 5000`。
 
 ## 建置與安裝
 
@@ -46,45 +48,40 @@ verbose = true                          # 印出每次切換的時間軸,調參�
 
 取代原本的 Velocity jar 即可;`enabled = false`(預設)時行為與官方版完全相同。
 
-## 運作流程
+## verbose log 範例
 
 ```
-玩家在 A ── /server B
-   │
-   ▼ PREPARE   B 登入後,proxy 自己回答 B 的 config(客戶端繼續在 A 遊玩)
-   ▼ BUFFER    B 進入 PLAY,快照封包進緩衝;proxy 代答 KeepAlive;
-   │           「開始等待區塊」事件被攔下(它是載入畫面的唯一觸發源)
-   ▼ COMMIT    收到約 25 個區塊封包即換手:清 A 的實體(RemoveEntities)、
-   │           tab、boss bar、title → 一次 flush 整份快照 → 斷開 A
-   ▼ LIVE      之後 B 的封包正常轉發
+Seamless transfer for <player> -> TW-1 committed (grace): prepare=26ms,
+buffer=196ms, commit=36ms, bufferedTargetPackets=184, chunkSizedPackets=3,
+droppedSourcePackets=0
 ```
 
-安全設計:B 斷線/逾時/kick → 玩家原地留在 A;B 要求資源包/cookie → 透明降級成
-原生切換(閃一下但不斷線);切換絕不把玩家踢回伺服器列表。
+## 安全設計(fallback)
 
-verbose log 範例:
+寧可有畫面、絕不斷線:
 
-```
-Seamless transfer for <player> -> SRV2 committed (chunks): prepare=100ms,
-buffer=736ms, commit=8ms, bufferedTargetPackets=164, chunkSizedPackets=25,
-suppressedLoadScreenEvents=2, droppedSourcePackets=0
-```
+| 情況 | 行為 |
+|---|---|
+| 不在同一 group / 版本不符 / 客戶端 <1.20.2 | 直接走原生切換 |
+| B 要求未安裝的資源包 / cookie / code of conduct | 透明降級成原生 config 切換 |
+| B 斷線 / 逾時 / kick | 中止,玩家原地留在 A |
+| A 在切換中要求 reconfiguration | 中止 seamless,跟隨 A |
+| 協定版本不在實體 id 對照表 | 實體清理停用(不 crash,殘留實體由 B 覆蓋) |
 
-## 跨版本(Hypixel 式)
+## 相容性
 
-後端全部維持單一版本,在 Velocity 的 `plugins/` 裝 **ViaVersion + ViaBackwards**
-(要支援 1.8 再加 ViaRewind)。封包 id 設定只跟後端版本綁定,不受客戶端版本影響;
-1.20.2 以下的客戶端自動走原生切換。
+- **third-party 封包外掛**(如 velocity-scoreboard-api + TAB):緩衝期間目標封包只當資料收集、
+  不執行任何封包的 `handle()`,所以外掛的封包 hook 不會在換手途中誤觸(避免反射假設
+  `BackendPlaySessionHandler` 而 crash)。
+- **跨版本(ViaVersion)**:後端維持單一版本、在 Velocity 裝 ViaVersion/ViaBackwards 即可。
+  封包 id 只跟後端版本綁定,不受客戶端版本影響。
 
 ## 已知限制
 
-- **玩家自身 entity id 不變**:切換後新伺服器用新 id 指涉玩家,以 entity id 指涉的
-  封包(metadata、attributes、藥水效果)會被忽略或錯掛,極端情況下可能與其他實體
-  id 相撞。完整解需要 player-id 重寫層(TODO)。
-- **Scoreboard 殘留**:舊伺服器建立的計分板不會被清除,需靠新伺服器重建覆蓋。
-- 兩台後端 `/time`、天氣不同時,切換瞬間會看到天色跳變(正常,B 的封包接管)。
-- seamless 路徑不觸發 `PlayerEnterConfigurationEvent` 系列事件(客戶端從未進 config);
-  `ServerPreConnectEvent` / `ServerConnectedEvent` / `ServerPostConnectEvent` 照常。
+- **玩家自身 entity id 不變**:切換後目標伺服器用新 id 指涉玩家;以 entity id 指涉玩家的
+  封包(metadata、attributes、藥水效果)可能被忽略或錯掛,直到下次更新覆蓋。
+- **Scoreboard 殘留**:來源伺服器建立的計分板不會被清除,需靠目標伺服器重建覆蓋。
+- **位置必須逐幀一致**:見前提條件 2。這是整個技術的硬性邊界。
 
 ## 改動檔案
 
@@ -92,9 +89,9 @@ suppressedLoadScreenEvents=2, droppedSourcePackets=0
 |---|---|
 | `connection/backend/SeamlessSwitchController.java` | 狀態機、緩衝、commit 觸發、abort |
 | `connection/backend/SeamlessConfigSessionHandler.java` | 代答 config + 透明降級 |
-| `connection/backend/SeamlessTransitionSessionHandler.java` | 緩衝 B 的 play 封包 |
+| `connection/backend/SeamlessTransitionSessionHandler.java` | 緩衝目標 play 封包 |
+| `connection/backend/SeamlessPacketIds.java` | 依協定版本查表選封包 id |
 | `connection/client/ClientPlaySessionHandler.java` | `doSeamlessSwitch()`(清理 + 快照 flush) |
+| `connection/MinecraftConnection.java` + `MinecraftSessionHandler.java` | 緩衝期間的封包攔截點 |
 | `connection/backend/BackendPlaySessionHandler.java` | 實體 id 追蹤、reconfig 防護 |
-| `connection/backend/LoginSessionHandler.java` | seamless 資格判斷分支 |
-| `connection/backend/VelocityServerConnection.java` | 追蹤實體 id 集合 |
 | `config/VelocityConfiguration.java` + `default-velocity.toml` | `[seamless-transfers]` 設定 |

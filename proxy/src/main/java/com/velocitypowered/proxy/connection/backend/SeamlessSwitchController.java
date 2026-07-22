@@ -45,11 +45,13 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
  * Orchestrates a seamless (PLAY-state) transfer between two backend servers that share the same
- * world template and player data. Instead of the regular {@code CONFIG}-state switch, which resets
- * the client and shows a loading screen, the target server's configuration phase is answered by
- * the proxy itself and its initial world snapshot is buffered. Once the snapshot looks complete,
- * it is applied to the client with a same-dimension respawn in a single flush, so the "downloading
- * terrain" screen has (nearly) no time to render.
+ * world template and synchronized player data. Instead of the regular {@code CONFIG}-state switch,
+ * which resets the client and shows a loading screen, the proxy answers the target server's
+ * configuration phase itself, buffers its initial packets, and swaps the backend without sending
+ * the client any world-switch packet — so the client keeps its rendered world. The target's
+ * "start waiting for chunks" event is forwarded unchanged; because the player is already at the
+ * same (synchronized) position with the chunk loaded, that wait resolves on the next frame and no
+ * loading screen is perceptible.
  *
  * <p>State machine: {@code PREPARING} (target logging in / configuring) → {@code BUFFERING}
  * (target in PLAY, snapshot packets accumulating) → {@code COMMITTING} → {@code LIVE}. Any error
@@ -101,7 +103,6 @@ public final class SeamlessSwitchController {
   private int bufferedTargetPackets;
   private int chunkSizedPacketsSeen;
   private int droppedSourcePackets;
-  private int suppressedLoadScreenEvents;
 
   /**
    * Creates a controller for one seamless switch attempt.
@@ -145,12 +146,12 @@ public final class SeamlessSwitchController {
       return false;
     }
     if (player.getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
-      // Older clients do not use the configuration state; the regular fast switch is already
-      // reasonably smooth there and this controller's respawn strategy targets 1.20.2+.
+      // Older clients do not use the configuration state, so the config-reset flicker this
+      // avoids does not exist there; the regular fast switch is already smooth.
       return false;
     }
     if (player.getConnection().getType() != ConnectionTypes.VANILLA) {
-      // Modded clients may not tolerate a same-dimension respawn without a full reset.
+      // Modded clients may not tolerate the backend swap without a full client reset.
       return false;
     }
     if (player.getSeamlessSwitchController() != null) {
@@ -224,14 +225,11 @@ public final class SeamlessSwitchController {
     if (state != State.BUFFERING && state != State.COMMITTING) {
       return;
     }
-    if (isLevelLoadStartEvent(buf)) {
-      // The client never receives a world-switch packet during a hot-swap, so this game event
-      // is the only thing that could make it display the "loading terrain" screen. The
-      // snapshot delivers the chunks in the same flush — there is nothing to wait for, so the
-      // event is dropped and no screen can appear.
-      suppressedLoadScreenEvents++;
-      return;
-    }
+    // Every packet — including the "start waiting for chunks" game event — is buffered and later
+    // forwarded unchanged. The event is deliberately NOT dropped: with synchronized player data
+    // the client is already at this position with the chunk loaded, so the "waiting for chunks"
+    // state resolves on the next frame and no screen is perceptible. Dropping it instead leaves
+    // the client unable to complete the load handshake (a stuck loading screen on 1.21+).
     buffer.add(buf.retain());
     bufferedTargetPackets++;
     if (state != State.BUFFERING) {
@@ -239,11 +237,9 @@ public final class SeamlessSwitchController {
       return;
     }
     // Primary trigger: the server sends "Chunk Batch Finished" once it has streamed a batch of
-    // initial chunks. The first batch contains the chunks nearest the player, so committing here
-    // means the client's surroundings — and the earlier, now-suppressed load-screen event — are
-    // all in the buffer. This is independent of how large the chunk packets compress to, which
-    // the size heuristic below is not.
-    if (chunkBatchFinishedId >= 0 && peekVarInt(buf) == chunkBatchFinishedId) {
+    // initial chunks. Committing here means the client's surroundings are in the buffer,
+    // independent of how large the chunk packets compress to (unlike the size heuristic below).
+    if (chunkBatchFinishedId >= 0 && SeamlessPacketIds.peekVarInt(buf) == chunkBatchFinishedId) {
       commit("chunk-batch");
       return;
     }
@@ -297,7 +293,7 @@ public final class SeamlessSwitchController {
 
   /**
    * Applies the buffered snapshot to the client: freezes the source connection, fires the connect
-   * events and performs the same-dimension respawn + snapshot flush.
+   * events and flushes the buffered target packets to the client.
    *
    * @param trigger what caused the commit (for logging)
    */
@@ -360,14 +356,12 @@ public final class SeamlessSwitchController {
             final long now = System.nanoTime();
             logger.info("Seamless transfer for {} -> {} committed ({}): prepare={}ms, "
                     + "buffer={}ms, commit={}ms, bufferedTargetPackets={}, "
-                    + "chunkSizedPackets={}, suppressedLoadScreenEvents={}, "
-                    + "droppedSourcePackets={}",
+                    + "chunkSizedPackets={}, droppedSourcePackets={}",
                 player.getUsername(), target.getServerInfo().getName(), trigger,
                 TimeUnit.NANOSECONDS.toMillis(joinGameNanos - prepareStartNanos),
                 TimeUnit.NANOSECONDS.toMillis(commitStartNanos - joinGameNanos),
                 TimeUnit.NANOSECONDS.toMillis(now - commitStartNanos),
-                bufferedTargetPackets, chunkSizedPacketsSeen,
-                suppressedLoadScreenEvents, droppedSourcePackets);
+                bufferedTargetPackets, chunkSizedPacketsSeen, droppedSourcePackets);
           }
         }, smc.eventLoop()).exceptionally(exc -> {
           logger.error("Unable to seamlessly switch to new server {} for {}",
@@ -435,59 +429,6 @@ public final class SeamlessSwitchController {
     if (task != null) {
       task.cancel(false);
     }
-  }
-
-  /**
-   * Fingerprints the "Game Event: start waiting for chunks" packet (event 13, value 0.0f)
-   * without knowing its version-specific packet id: the payload is exactly [varint packet id]
-   * [unsigned byte 13][float 0.0f]. The length, event byte and all-zero float together make
-   * accidental matches on other packet types practically impossible.
-   *
-   * @param buf the raw packet, readerIndex at the packet id
-   * @return true if this is the level-load-start game event
-   */
-  private static boolean isLevelLoadStartEvent(ByteBuf buf) {
-    final int readable = buf.readableBytes();
-    if (readable < 6 || readable > 8) {
-      return false;
-    }
-    final int readerIndex = buf.readerIndex();
-    int idLength = 0;
-    for (int i = 0; i < 3; i++) {
-      idLength++;
-      if ((buf.getByte(readerIndex + i) & 0x80) == 0) {
-        break;
-      }
-    }
-    if (readable != idLength + 5) {
-      return false;
-    }
-    if ((buf.getByte(readerIndex + idLength) & 0xFF) != 13) {
-      return false;
-    }
-    return buf.getInt(readerIndex + idLength + 1) == 0;
-  }
-
-  /**
-   * Reads the leading varint (packet id) of a raw packet without consuming it.
-   *
-   * @param buf the raw packet, readerIndex at the packet id
-   * @return the packet id, or -1 if it could not be read within 3 bytes
-   */
-  private static int peekVarInt(ByteBuf buf) {
-    final int readerIndex = buf.readerIndex();
-    int result = 0;
-    for (int i = 0; i < 3; i++) {
-      if (buf.writerIndex() <= readerIndex + i) {
-        return -1;
-      }
-      final byte read = buf.getByte(readerIndex + i);
-      result |= (read & 0x7F) << (7 * i);
-      if ((read & 0x80) == 0) {
-        return result;
-      }
-    }
-    return -1;
   }
 
   /**

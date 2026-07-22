@@ -18,6 +18,7 @@
 package com.velocitypowered.proxy.connection.backend;
 
 import com.velocitypowered.api.network.ProtocolVersion;
+import io.netty.buffer.ByteBuf;
 
 /**
  * Per-protocol-version clientbound packet ids that seamless transfers need but Velocity does not
@@ -96,5 +97,27 @@ public final class SeamlessPacketIds {
    */
   public static boolean entityCleanupSupported(ProtocolVersion version) {
     return addEntityId(version) >= 0 && removeEntitiesId(version) >= 0;
+  }
+
+  /**
+   * Reads the leading varint (packet id) of a raw packet without consuming it.
+   *
+   * @param buf the raw packet, readerIndex at the packet id
+   * @return the packet id, or -1 if it could not be read within 3 bytes
+   */
+  public static int peekVarInt(ByteBuf buf) {
+    final int readerIndex = buf.readerIndex();
+    int result = 0;
+    for (int i = 0; i < 3; i++) {
+      if (buf.writerIndex() <= readerIndex + i) {
+        return -1;
+      }
+      final byte read = buf.getByte(readerIndex + i);
+      result |= (read & 0x7F) << (7 * i);
+      if ((read & 0x80) == 0) {
+        return result;
+      }
+    }
+    return -1;
   }
 }
