@@ -17,6 +17,7 @@
 
 package com.velocitypowered.proxy.connection.backend;
 
+import com.velocitypowered.api.event.player.PlayerClientLoadedWorldEvent;
 import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.player.ServerPostConnectEvent;
 import com.velocitypowered.api.network.ProtocolVersion;
@@ -33,6 +34,7 @@ import com.velocitypowered.proxy.connection.util.ConnectionRequestResults.Impl;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.packet.JoinGamePacket;
+import com.velocitypowered.proxy.protocol.packet.ServerboundPlayerLoadedPacket;
 import io.netty.buffer.ByteBuf;
 import io.netty.util.ReferenceCountUtil;
 import java.util.ArrayDeque;
@@ -369,6 +371,18 @@ public final class SeamlessSwitchController {
           player.setConnectedServer(target);
           if (source != null) {
             source.disconnect();
+          }
+
+          // The client never rebuilds its level on a hot-swap, so it will not send the "player
+          // loaded" packet a 1.21.4+ backend waits for before processing movement (otherwise the
+          // player stays frozen until the server's ~3s timeout). Report the load on the client's
+          // behalf and keep the proxy's own loaded state/event in sync. Skipped when the join
+          // contained a genuine Respawn: the client really reloads and reports it itself.
+          if (!worldChangeSeen
+              && player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_21_4)) {
+            smc.write(ServerboundPlayerLoadedPacket.INSTANCE);
+            target.setClientLoaded(true);
+            server.getEventManager().fireAndForget(new PlayerClientLoadedWorldEvent(player));
           }
           smc.setAutoReading(true);
 

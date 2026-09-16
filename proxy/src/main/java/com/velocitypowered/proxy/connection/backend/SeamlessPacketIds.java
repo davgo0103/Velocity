@@ -69,6 +69,7 @@ public final class SeamlessPacketIds {
       case MINECRAFT_1_21_5, MINECRAFT_1_21_6, MINECRAFT_1_21_7 -> 0x46;
       case MINECRAFT_1_21_9, MINECRAFT_1_21_11 -> 0x4B;
       case MINECRAFT_26_1, MINECRAFT_26_2 -> 0x4D;
+      case MINECRAFT_26_3 -> 0x4E;
       default -> -1;
     };
   }
@@ -84,7 +85,8 @@ public final class SeamlessPacketIds {
       case MINECRAFT_1_20_2, MINECRAFT_1_20_3, MINECRAFT_1_20_5,
            MINECRAFT_1_21, MINECRAFT_1_21_2, MINECRAFT_1_21_4 -> 0x0C;
       case MINECRAFT_1_21_5, MINECRAFT_1_21_6, MINECRAFT_1_21_7,
-           MINECRAFT_1_21_9, MINECRAFT_1_21_11, MINECRAFT_26_1, MINECRAFT_26_2 -> 0x0B;
+           MINECRAFT_1_21_9, MINECRAFT_1_21_11, MINECRAFT_26_1, MINECRAFT_26_2,
+           MINECRAFT_26_3 -> 0x0B;
       default -> -1;
     };
   }
@@ -108,6 +110,7 @@ public final class SeamlessPacketIds {
       case MINECRAFT_1_21_5, MINECRAFT_1_21_6, MINECRAFT_1_21_7 -> 0x4B;
       case MINECRAFT_1_21_9, MINECRAFT_1_21_11 -> 0x50;
       case MINECRAFT_26_1, MINECRAFT_26_2 -> 0x52;
+      case MINECRAFT_26_3 -> 0x54;
       default -> -1;
     };
   }
