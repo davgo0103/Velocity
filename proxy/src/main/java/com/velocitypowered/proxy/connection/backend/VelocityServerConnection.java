@@ -70,6 +70,7 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
   private final VelocityServer server;
   private @Nullable MinecraftConnection connection;
   private boolean hasCompletedJoin = false;
+  private boolean clientLoaded = false; // 1.21.4+
   private boolean gracefulDisconnect = false;
   private BackendConnectionPhase connectionPhase = BackendConnectionPhases.UNKNOWN;
   private final Map<Long, Long> pendingPings = new HashMap<>();
@@ -319,6 +320,15 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
         }
       }
     }
+  }
+
+  public void setClientLoaded(boolean clientLoaded) {
+    this.clientLoaded = clientLoaded;
+  }
+
+  @Override
+  public boolean isClientLoaded() {
+    return clientLoaded;
   }
 
   boolean isGracefulDisconnect() {
