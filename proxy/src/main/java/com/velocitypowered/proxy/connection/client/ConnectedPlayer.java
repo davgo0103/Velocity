@@ -184,6 +184,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   private @Nullable VelocityServerConnection connectionInFlight;
   private @Nullable SeamlessSwitchController seamlessSwitchController;
   private @Nullable SeamlessEntityIdRemapper entityIdRemapper;
+  private @Nullable VelocityServerConnection seamlessOrphanSource;
   private int chatIndexOffset;
   private int nextClientChatIndex;
   private @Nullable PlayerSettings settings;
@@ -796,6 +797,9 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
       VelocityServerConnection previousConnection = connectedServer;
       if (kickedFromCurrent) {
         connectedServer = null;
+        // The client is still in PLAY with the kicked server's world loaded, so a redirect
+        // (e.g. a fallback plugin) can still hot-swap into a server of the same group.
+        seamlessOrphanSource = previousConnection;
       }
 
       if (!isActive()) {
@@ -918,6 +922,9 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   public void setConnectedServer(@Nullable VelocityServerConnection serverConnection) {
     this.connectedServer = serverConnection;
     this.tryIndex = 0; // reset since we got connected to a server
+    if (serverConnection != null) {
+      this.seamlessOrphanSource = null; // the client now shows this server's world
+    }
 
     if (serverConnection == connectionInFlight) {
       connectionInFlight = null;
@@ -1467,6 +1474,18 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
 
   public void setEntityIdRemapper(@Nullable SeamlessEntityIdRemapper remapper) {
     this.entityIdRemapper = remapper;
+  }
+
+  /**
+   * Returns the server whose world the client currently shows: the connected server, or, after a
+   * kick, the (already closed) connection the player was kicked from, until the client is moved
+   * to another server.
+   *
+   * @return the seamless source connection, or null
+   */
+  public @Nullable VelocityServerConnection getSeamlessSource() {
+    final VelocityServerConnection current = connectedServer;
+    return current != null ? current : seamlessOrphanSource;
   }
 
   /**

@@ -130,7 +130,7 @@ public final class SeamlessSwitchController {
       VelocityServerConnection target, CompletableFuture<Impl> resultFuture) {
     this.server = server;
     this.player = player;
-    this.source = player.getConnectedServer();
+    this.source = player.getSeamlessSource();
     this.target = target;
     this.resultFuture = resultFuture;
     this.config = server.getConfiguration().getSeamlessTransfersConfig();
@@ -173,7 +173,7 @@ public final class SeamlessSwitchController {
     if (player.getSeamlessSwitchController() != null) {
       return false;
     }
-    final VelocityServerConnection current = player.getConnectedServer();
+    final VelocityServerConnection current = player.getSeamlessSource();
     if (current == null || !current.hasCompletedJoin()) {
       return false;
     }

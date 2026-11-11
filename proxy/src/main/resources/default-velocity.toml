@@ -201,49 +201,44 @@ map = "Velocity"
 show-plugins = false
 
 [seamless-transfers]
-# EXPERIMENTAL: keep players in the PLAY state when switching between backend servers of the
-# same group, avoiding the "loading terrain" screen. The proxy answers the new server's
-# configuration phase itself and swaps the backend without sending the client any world-switch
-# packet, so the client keeps its rendered world. Both servers of a group MUST share the same
-# world template (dimension types, world names) AND synchronize player data INCLUDING the exact
-# position (e.g. via a player-data sync plugin) — if the position differs at all, the client must
-# genuinely load new terrain and the screen cannot be hidden. Backends must also run with
-# enforce-secure-profile=false (the client only sends its chat session after a JoinGame, which a
-# hot-swap never sends); a backend that enforces secure chat automatically gets the regular
-# switch instead. If those preconditions do not hold, leave this disabled.
+# 實驗性功能:在同一組(group)的後端伺服器之間切換時,讓玩家維持在 PLAY 狀態,
+# 不出現「正在載入地形」畫面。proxy 會代替客戶端回答新伺服器的 config 階段,
+# 換手時不送客戶端任何換世界的封包,客戶端因此保留目前的世界畫面。
+# 前提條件(缺一不可):
+#   1. 同一組的伺服器共用同一份世界模板(維度、世界名稱一致)。
+#   2. 玩家資料同步,而且包含精確座標(例如透過玩家資料同步插件)。
+#      座標只要有落差,客戶端就必須真的載入新地形,畫面無法消除。
+#   3. 後端設定 enforce-secure-profile=false。客戶端只在收到 JoinGame 後才會把聊天
+#      session 送給伺服器,熱切換不送 JoinGame;強制簽名聊天的後端會自動改走一般切換。
+# 不符合這些條件時請保持停用。
 enabled = false
 
-# Groups of servers that share a world template and player data. Seamless transfers only
-# happen between servers listed in the same group; all other switches use the normal path.
-# Example: server-groups = [ ["lobby", "survival"], ["mini1", "mini2"] ]
+# 共用世界模板與玩家資料的伺服器分組(填 [servers] 裡的名稱)。
+# 只有同一組內互相切換才會無縫,其他切換一律走一般流程。
+# 範例:server-groups = [ ["lobby", "survival"], ["mini1", "mini2"] ]
 server-groups = []
 
-# The swap happens once the new server has streamed the chunks around the player: on its
-# "Chunk Batch Finished" packet when it sends one (Paper-based servers usually do not), otherwise
-# by the chunk-size heuristic below.
+# 換手時機:新伺服器把玩家周圍的區塊送出後就換手。若伺服器送出「Chunk Batch Finished」
+# 封包就以它為準(Paper / Purpur 在玩家進服時通常不送),否則由下面的區塊大小判斷決定。
 
-# Commit as soon as this many chunk-sized packets have been buffered. Servers send the chunks
-# closest to the player first, so the area around the player refreshes before the swap; the
-# remaining chunks continue streaming normally afterwards. Roughly (2r+1)^2 for a radius r.
-# Set to 0 to disable and rely on the quiet window/timeout instead.
+# 緩衝到這麼多個「區塊大小」的封包就立即換手。伺服器會先送離玩家最近的區塊,
+# 所以換手前玩家周圍已經更新,其餘區塊換手後照常繼續傳送。
+# 大約是 (2r+1)^2,r 為半徑。設為 0 則停用,改靠下面的靜止時間或逾時。
 commit-chunk-packets = 25
 
-# Packets at least this large (bytes) are considered chunk data for the snapshot-completion
-# heuristic. Lower this for very sparse worlds (superflat/void).
+# 大於等於這個大小(位元組)的封包視為區塊資料,用於判斷快照是否完整。
+# 非常空曠的世界(超平坦、虛空)請調低。
 chunk-packet-min-bytes = 4096
 
-# Quiet window in milliseconds: once chunk data has been observed, the snapshot is applied
-# after no further chunk-sized packets arrive for this long.
+# 靜止時間(毫秒):收到區塊資料後,若這段時間內沒有新的區塊大小封包就換手。
 commit-grace-ms = 150
 
-# Hard deadline in milliseconds after the target server's JoinGame packet; the snapshot is
-# applied even if it may still be incomplete.
+# 硬性上限(毫秒):從目標伺服器送出 JoinGame 起算,時間到了就算快照可能不完整也直接換手。
 commit-timeout-ms = 2000
 
-# Deadline in milliseconds for the target server to finish login + configuration before the
-# seamless attempt is aborted (the player simply stays on the current server).
+# 目標伺服器完成登入與 config 階段的期限(毫秒)。逾時則放棄無縫切換,玩家留在原伺服器。
 prepare-timeout-ms = 5000
 
-# Log the packet timeline (prepare/buffer/commit durations, buffered packet counts) of every
-# seamless switch. Useful for tuning the values above.
+# 在 log 記錄每次無縫切換的時間軸(prepare / buffer / commit 耗時、緩衝封包數),
+# 調整上面的數值時很有用。
 verbose = false

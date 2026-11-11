@@ -800,7 +800,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     // the same world template, so the terrain on screen is already correct) and the target's
     // position sync, chunks and entity spawns in the snapshot simply take over.
     final SeamlessPacketIds.Table ids = SeamlessPacketIds.forVersion(player.getProtocolVersion());
-    final VelocityServerConnection previous = player.getConnectedServer();
+    final VelocityServerConnection previous = player.getSeamlessSource();
 
     // The client also keeps its entity id, while the target refers to the player by its own:
     // translate between the two from now on (see SeamlessEntityIdRemapper).
