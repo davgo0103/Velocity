@@ -53,10 +53,11 @@ verbose = false                                 # 需要調參 / 觀察時間軸
 就這樣——**不需要設定任何封包 id**。需要的封包 id 會依每條連線的協定版本自動選擇
 (內建對照表,涵蓋 1.20.2 ~ 26.3;表裡沒有的版本自動走原生切換)。
 
-換手時機:目標伺服器送出第一批區塊(Chunk Batch Finished)就換手。
-進階選項(通常不用動):`commit-timeout-ms = 2000`(等不到第一批區塊時的上限)、
-`prepare-timeout-ms = 5000`。舊版的 `commit-chunk-packets`、`chunk-packet-min-bytes`、
-`commit-grace-ms` 已移除,留在設定檔裡也不影響。
+換手時機:原版伺服器在送完第一批區塊(Chunk Batch Finished)時換手;Paper / Purpur
+在 join 時不送這個標記,改由區塊大小啟發式判斷(收到 `commit-chunk-packets` 個大封包,
+或大封包停了 `commit-grace-ms`)。進階選項(通常不用動):`commit-chunk-packets = 25`、
+`chunk-packet-min-bytes = 4096`、`commit-grace-ms = 150`、`commit-timeout-ms = 2000`、
+`prepare-timeout-ms = 5000`。
 
 ## 支援新的 Minecraft 版本
 
@@ -78,9 +79,9 @@ Velocity 支援的版本時讓建置失敗,不會悄悄退化。Respawn 的 id �
 ## verbose log 範例
 
 ```
-Seamless transfer for <player> -> TW-1 committed (chunk-batch): prepare=26ms,
-buffer=96ms, commit=36ms, bufferedTargetPackets=184, suppressedLoadScreenEvents=1,
-worldChange=false, droppedSourcePackets=0
+Seamless transfer for <player> -> TW-1 committed (grace): prepare=26ms,
+buffer=196ms, commit=36ms, bufferedTargetPackets=184, chunkSizedPackets=3,
+suppressedLoadScreenEvents=1, worldChange=false, droppedSourcePackets=0
 ```
 
 ## 安全設計(fallback)

@@ -218,9 +218,26 @@ enabled = false
 # Example: server-groups = [ ["lobby", "survival"], ["mini1", "mini2"] ]
 server-groups = []
 
-# The swap happens as soon as the new server has sent its first batch of chunks around the
-# player. Hard deadline in milliseconds after the new server's JoinGame packet, in case that
-# batch never arrives; the snapshot is then applied as it is.
+# The swap happens once the new server has streamed the chunks around the player: on its
+# "Chunk Batch Finished" packet when it sends one (Paper-based servers usually do not), otherwise
+# by the chunk-size heuristic below.
+
+# Commit as soon as this many chunk-sized packets have been buffered. Servers send the chunks
+# closest to the player first, so the area around the player refreshes before the swap; the
+# remaining chunks continue streaming normally afterwards. Roughly (2r+1)^2 for a radius r.
+# Set to 0 to disable and rely on the quiet window/timeout instead.
+commit-chunk-packets = 25
+
+# Packets at least this large (bytes) are considered chunk data for the snapshot-completion
+# heuristic. Lower this for very sparse worlds (superflat/void).
+chunk-packet-min-bytes = 4096
+
+# Quiet window in milliseconds: once chunk data has been observed, the snapshot is applied
+# after no further chunk-sized packets arrive for this long.
+commit-grace-ms = 150
+
+# Hard deadline in milliseconds after the target server's JoinGame packet; the snapshot is
+# applied even if it may still be incomplete.
 commit-timeout-ms = 2000
 
 # Deadline in milliseconds for the target server to finish login + configuration before the
@@ -228,5 +245,5 @@ commit-timeout-ms = 2000
 prepare-timeout-ms = 5000
 
 # Log the packet timeline (prepare/buffer/commit durations, buffered packet counts) of every
-# seamless switch.
+# seamless switch. Useful for tuning the values above.
 verbose = false

@@ -184,6 +184,8 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   private @Nullable VelocityServerConnection connectionInFlight;
   private @Nullable SeamlessSwitchController seamlessSwitchController;
   private @Nullable SeamlessEntityIdRemapper entityIdRemapper;
+  private int chatIndexOffset;
+  private int nextClientChatIndex;
   private @Nullable PlayerSettings settings;
   private @Nullable ModInfo modInfo;
   private final Set<VelocityBossBarImplementation> bossBars = new HashSet<>();
@@ -1465,6 +1467,31 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
 
   public void setEntityIdRemapper(@Nullable SeamlessEntityIdRemapper remapper) {
     this.entityIdRemapper = remapper;
+  }
+
+  /**
+   * Translates the global index of a clientbound player chat message (1.21.5+). The client
+   * disconnects on any gap in this sequence, and only resets it on a JoinGame, which a seamless
+   * transfer never sends; the new backend starts counting at 0, so its indices are shifted.
+   *
+   * @param backendIndex the index the backend wrote
+   * @return the index to send to the client
+   */
+  public int toClientChatIndex(int backendIndex) {
+    final int clientIndex = backendIndex + chatIndexOffset;
+    nextClientChatIndex = clientIndex + 1;
+    return clientIndex;
+  }
+
+  /** Called on a seamless commit: the new backend's chat indices start at 0. */
+  public void continueChatIndexAfterSeamlessSwitch() {
+    chatIndexOffset = nextClientChatIndex;
+  }
+
+  /** Called when the client receives a JoinGame and restarts its chat index sequence. */
+  public void resetChatIndex() {
+    chatIndexOffset = 0;
+    nextClientChatIndex = 0;
   }
 
   /**

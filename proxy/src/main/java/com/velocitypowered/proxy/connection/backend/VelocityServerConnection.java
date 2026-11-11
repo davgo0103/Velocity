@@ -398,10 +398,36 @@ public class VelocityServerConnection implements MinecraftConnectionAssociation,
       }
     }
     trackEntityIds(out, ids);
-    if (SeamlessPacketIds.isSignedPlayerChat(out, ids, proxyPlayer.getProtocolVersion())) {
-      proxyPlayer.getChatQueue().onBackendSignedMessage();
+    if (SeamlessPacketIds.peekVarInt(out) == ids.playerChat()) {
+      if (SeamlessPacketIds.isSignedPlayerChat(out, ids, proxyPlayer.getProtocolVersion())) {
+        proxyPlayer.getChatQueue().onBackendSignedMessage();
+      }
+      if (proxyPlayer.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_21_5)) {
+        out = rewriteChatGlobalIndex(out);
+      }
     }
     return out;
+  }
+
+  /** Shifts a 1.21.5+ player chat packet's global index into the client's sequence. */
+  private ByteBuf rewriteChatGlobalIndex(ByteBuf buf) {
+    try {
+      final ByteBuf in = buf.duplicate();
+      final int packetId = ProtocolUtils.readVarInt(in);
+      final int backendIndex = ProtocolUtils.readVarInt(in);
+      final int clientIndex = proxyPlayer.toClientChatIndex(backendIndex);
+      if (clientIndex == backendIndex) {
+        return buf;
+      }
+      final ByteBuf out = buf.alloc().buffer(buf.readableBytes() + 5);
+      ProtocolUtils.writeVarInt(out, packetId);
+      ProtocolUtils.writeVarInt(out, clientIndex);
+      out.writeBytes(in);
+      buf.release();
+      return out;
+    } catch (RuntimeException e) {
+      return buf; // malformed: forward untouched
+    }
   }
 
   private void trackEntityIds(ByteBuf buf, SeamlessPacketIds.Table ids) {

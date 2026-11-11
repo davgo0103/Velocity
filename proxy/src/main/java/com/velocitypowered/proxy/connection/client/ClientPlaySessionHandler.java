@@ -205,6 +205,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     player.discardChatQueue();
     // Leaving PLAY: the client will adopt the next JoinGame's entity id.
     player.setEntityIdRemapper(null);
+    player.resetChatIndex();
     PluginMessagePacket message;
     while ((message = loginPluginMessages.poll()) != null) {
       ReferenceCountUtil.release(message);
@@ -683,6 +684,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     // The client received this JoinGame (or the respawn built from it), so it now uses the
     // backend's entity id itself: any translation left by a seamless transfer is obsolete.
     player.setEntityIdRemapper(null);
+    player.resetChatIndex();
     if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
       player.getBossBarManager().sendBossBars();
     } else {
@@ -809,6 +811,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     final SeamlessEntityIdRemapper remapper =
         SeamlessEntityIdRemapper.create(clientEntityId, joinGame.getEntityId(), ids);
     player.setEntityIdRemapper(remapper);
+    player.continueChatIndexAfterSeamlessSwitch();
 
     if (ids != null) {
       // The previous server's entities survive in the client's level; remove them. Tracked ids

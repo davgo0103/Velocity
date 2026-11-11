@@ -106,11 +106,14 @@ public final class SeamlessSwitchController {
   private @Nullable JoinGamePacket targetJoinGame;
   private @Nullable ScheduledFuture<?> prepareTimeoutTask;
   private @Nullable ScheduledFuture<?> commitTimeoutTask;
+  private @Nullable ScheduledFuture<?> graceCheckTask;
 
   // Instrumentation, logged on commit.
   private final long prepareStartNanos = System.nanoTime();
   private long joinGameNanos;
+  private long lastChunkPacketNanos;
   private int bufferedTargetPackets;
+  private int chunkSizedPacketsSeen;
   private int droppedSourcePackets;
   private int suppressedLoadScreenEvents;
   private boolean worldChangeSeen;
@@ -207,10 +210,12 @@ public final class SeamlessSwitchController {
     this.targetJoinGame = joinGame;
     this.state = State.BUFFERING;
     this.joinGameNanos = System.nanoTime();
+    this.lastChunkPacketNanos = joinGameNanos;
     cancel(prepareTimeoutTask);
     prepareTimeoutTask = null;
     this.commitTimeoutTask = player.getConnection().eventLoop().schedule(
         () -> commit("timeout"), config.commitTimeoutMs(), TimeUnit.MILLISECONDS);
+    scheduleGraceCheck(config.commitGraceMs());
   }
 
   /**
@@ -229,6 +234,7 @@ public final class SeamlessSwitchController {
     state = State.ABORTED;
     cancel(prepareTimeoutTask);
     cancel(commitTimeoutTask);
+    cancel(graceCheckTask);
     releaseBuffer();
     player.clearSeamlessSwitchController(this);
     target.disconnect();
@@ -299,11 +305,45 @@ public final class SeamlessSwitchController {
     }
     buffer.add(buf.retain());
     bufferedTargetPackets++;
-    // Commit once the server has streamed its first batch of initial chunks ("Chunk Batch
-    // Finished"): the client's surroundings are then in the buffer. Every supported version
-    // (1.20.2+) batches chunks, so this is the only trigger besides the timeout.
-    if (state == State.BUFFERING && packetId == ids.chunkBatchFinished()) {
+    if (state != State.BUFFERING) {
+      return; // already committing; just collect for the flush
+    }
+    // Vanilla servers end each batch of initial chunks with "Chunk Batch Finished"; the client's
+    // surroundings are then in the buffer.
+    if (packetId == ids.chunkBatchFinished()) {
       commit("chunk-batch");
+      return;
+    }
+    // Paper-based servers (Moonrise chunk system) stream join chunks without that marker, so the
+    // size heuristic does the work there: chunk data is far larger than steady tick traffic.
+    if (buf.readableBytes() >= config.chunkPacketMinBytes()) {
+      chunkSizedPacketsSeen++;
+      lastChunkPacketNanos = System.nanoTime();
+      if (config.commitChunkPackets() > 0
+          && chunkSizedPacketsSeen >= config.commitChunkPackets()) {
+        commit("chunks");
+      }
+    }
+  }
+
+  private void scheduleGraceCheck(long delayMs) {
+    graceCheckTask = player.getConnection().eventLoop().schedule(this::graceCheck,
+        delayMs, TimeUnit.MILLISECONDS);
+  }
+
+  private void graceCheck() {
+    if (state != State.BUFFERING) {
+      return;
+    }
+    // A live server never goes fully quiet (time updates and entity movement arrive every tick),
+    // so the quiet window only considers chunk-sized packets: once the initial chunk burst stops
+    // for commitGraceMs, the snapshot is as complete as it will get.
+    final long chunkQuietMs =
+        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastChunkPacketNanos);
+    if (chunkSizedPacketsSeen > 0 && chunkQuietMs >= config.commitGraceMs()) {
+      commit("grace");
+    } else {
+      scheduleGraceCheck(Math.max(config.commitGraceMs() - chunkQuietMs, 20));
     }
   }
 
@@ -333,7 +373,9 @@ public final class SeamlessSwitchController {
     }
     state = State.COMMITTING;
     cancel(commitTimeoutTask);
+    cancel(graceCheckTask);
     commitTimeoutTask = null;
+    graceCheckTask = null;
 
     final long commitStartNanos = System.nanoTime();
     final MinecraftConnection smc = target.ensureConnected();
@@ -405,13 +447,13 @@ public final class SeamlessSwitchController {
           if (config.verbose()) {
             final long now = System.nanoTime();
             logger.info("Seamless transfer for {} -> {} committed ({}): prepare={}ms, "
-                    + "buffer={}ms, commit={}ms, bufferedTargetPackets={}, "
+                    + "buffer={}ms, commit={}ms, bufferedTargetPackets={}, chunkSizedPackets={}, "
                     + "suppressedLoadScreenEvents={}, worldChange={}, droppedSourcePackets={}",
                 player.getUsername(), target.getServerInfo().getName(), trigger,
                 TimeUnit.NANOSECONDS.toMillis(joinGameNanos - prepareStartNanos),
                 TimeUnit.NANOSECONDS.toMillis(commitStartNanos - joinGameNanos),
                 TimeUnit.NANOSECONDS.toMillis(now - commitStartNanos),
-                bufferedTargetPackets, suppressedLoadScreenEvents,
+                bufferedTargetPackets, chunkSizedPacketsSeen, suppressedLoadScreenEvents,
                 worldChangeSeen, droppedSourcePackets);
           }
         }, smc.eventLoop()).exceptionally(exc -> {
@@ -438,6 +480,7 @@ public final class SeamlessSwitchController {
     state = State.ABORTED;
     cancel(prepareTimeoutTask);
     cancel(commitTimeoutTask);
+    cancel(graceCheckTask);
     releaseBuffer();
     player.clearSeamlessSwitchController(this);
     target.disconnect();
@@ -463,6 +506,7 @@ public final class SeamlessSwitchController {
     state = State.ABORTED;
     cancel(prepareTimeoutTask);
     cancel(commitTimeoutTask);
+    cancel(graceCheckTask);
     releaseBuffer();
     player.clearSeamlessSwitchController(this);
   }

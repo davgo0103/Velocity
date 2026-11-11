@@ -182,6 +182,7 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
     packet.setOnlineMode(serverConn.getPlayer().isOnlineMode());
     // The client adopts this JoinGame's entity id, ending any seamless-transfer translation.
     serverConn.getPlayer().setEntityIdRemapper(null);
+    serverConn.getPlayer().resetChatIndex();
     serverConn.setEntityId(packet.getEntityId());
     return false; // forward
   }

@@ -1025,16 +1025,23 @@ public class VelocityConfiguration implements ProxyConfig {
    * @param enabled                whether seamless transfers are enabled at all
    * @param serverGroups           groups of server names sharing the same world template +
    *                               player data
+   * @param commitGraceMs          quiet window (ms) with no new chunk-sized packets before the
+   *                               snapshot is applied
    * @param commitTimeoutMs        hard deadline (ms) after JoinGame before the snapshot is
-   *                               applied even without a "Chunk Batch Finished" from the server
+   *                               force-applied
    * @param prepareTimeoutMs       deadline (ms) for the whole prepare phase before falling back
+   * @param chunkPacketMinBytes    packets at least this large are considered chunk data for the
+   *                               snapshot-completion heuristic
+   * @param commitChunkPackets     commit as soon as this many chunk-sized packets have been
+   *                               buffered; servers send chunks closest to the player first
    * @param verbose                whether to log the packet timeline of every seamless switch
    */
   public record SeamlessTransfersConfig(boolean enabled, List<List<String>> serverGroups,
-                                        int commitTimeoutMs, int prepareTimeoutMs,
-                                        boolean verbose) {
+                                        int commitGraceMs, int commitTimeoutMs,
+                                        int prepareTimeoutMs, int chunkPacketMinBytes,
+                                        int commitChunkPackets, boolean verbose) {
     public static final SeamlessTransfersConfig DEFAULT =
-        new SeamlessTransfersConfig(false, List.of(), 2000, 5000, false);
+        new SeamlessTransfersConfig(false, List.of(), 150, 2000, 5000, 4096, 25, false);
 
     /**
      * Returns a SeamlessTransfersConfig from a config section, or the default if the section
@@ -1051,8 +1058,11 @@ public class VelocityConfiguration implements ProxyConfig {
       return new SeamlessTransfersConfig(
           config.getOrElse("enabled", DEFAULT.enabled()),
           groups,
+          config.getIntOrElse("commit-grace-ms", DEFAULT.commitGraceMs()),
           config.getIntOrElse("commit-timeout-ms", DEFAULT.commitTimeoutMs()),
           config.getIntOrElse("prepare-timeout-ms", DEFAULT.prepareTimeoutMs()),
+          config.getIntOrElse("chunk-packet-min-bytes", DEFAULT.chunkPacketMinBytes()),
+          config.getIntOrElse("commit-chunk-packets", DEFAULT.commitChunkPackets()),
           config.getOrElse("verbose", DEFAULT.verbose())
       );
     }
