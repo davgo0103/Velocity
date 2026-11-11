@@ -45,7 +45,6 @@ import com.velocitypowered.proxy.connection.player.resourcepack.VelocityResource
 import com.velocitypowered.proxy.connection.player.resourcepack.handler.ResourcePackHandler;
 import com.velocitypowered.proxy.connection.util.ConnectionMessages;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
-import com.velocitypowered.proxy.protocol.ProtocolUtils;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.netty.MinecraftVarintFrameDecoder;
@@ -96,19 +95,11 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
       Integer.getInteger("velocity.max-packets-per-flush", 8192);
   private static final int LARGE_PACKET_THRESHOLD = 1024 * 128;
 
-  // Safety cap so a misbehaving backend cannot grow the set without bound. A player realistically
-  // sees at most a few thousand entities within render distance, so 16384 is a generous ceiling
-  // that keeps the (boxed) set's worst-case memory small.
-  private static final int MAX_TRACKED_ENTITY_IDS = 1 << 14;
-
   private final VelocityServer server;
   private final VelocityServerConnection serverConn;
   private final ClientPlaySessionHandler playerSessionHandler;
   private final MinecraftConnection playerConnection;
   private final BungeeCordMessageResponder bungeecordMessageResponder;
-  private final boolean trackEntityIds;
-  private final int addEntityPacketId;
-  private final int removeEntitiesPacketId;
   private boolean exceptionTriggered = false;
   private int packetsFlushed;
 
@@ -116,15 +107,6 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
     this.server = server;
     this.serverConn = serverConn;
     this.playerConnection = serverConn.getPlayer().getConnection();
-
-    // Entity packet ids are selected automatically from the connection's protocol version, so
-    // ghost cleanup needs no per-server configuration; it is simply skipped on versions whose
-    // ids are not yet in the table.
-    final ProtocolVersion version = serverConn.getPlayer().getProtocolVersion();
-    this.addEntityPacketId = SeamlessPacketIds.addEntityId(version);
-    this.removeEntitiesPacketId = SeamlessPacketIds.removeEntitiesId(version);
-    this.trackEntityIds = server.getConfiguration().getSeamlessTransfersConfig().enabled()
-        && SeamlessPacketIds.entityCleanupSupported(version);
 
     MinecraftSessionHandler psh = playerConnection.getActiveSessionHandler();
     if (!(psh instanceof ClientPlaySessionHandler)) {
@@ -198,6 +180,9 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
   public boolean handle(JoinGamePacket packet) {
     // We receive this if the connection is reconfigured
     packet.setOnlineMode(serverConn.getPlayer().isOnlineMode());
+    // The client adopts this JoinGame's entity id, ending any seamless-transfer translation.
+    serverConn.getPlayer().setEntityIdRemapper(null);
+    serverConn.setEntityId(packet.getEntityId());
     return false; // forward
   }
 
@@ -504,35 +489,13 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
-    if (System.nanoTime() < serverConn.getSuppressLoadScreenUntilNanos()) {
-      // Velocity registers Respawn encode-only, so a backend Respawn arrives opaque: a genuine
-      // world change during the seamless-join window. The client rebuilds its level and needs
-      // the "start waiting for chunks" events again — cancel the suppression before forwarding.
-      final int respawnId =
-          SeamlessPacketIds.respawnId(serverConn.getPlayer().getProtocolVersion());
-      if (respawnId >= 0 && SeamlessPacketIds.peekVarInt(buf) == respawnId) {
-        serverConn.setSuppressLoadScreenUntilNanos(0);
-        if (server.getConfiguration().getSeamlessTransfersConfig().verbose()) {
-          logger.info("Seamless: live Respawn from {} during the join window for {} — genuine "
-                  + "world change, load-screen suppression cancelled (a real reload follows)",
-              serverConn.getServerInfo().getName(), serverConn.getPlayer().getUsername());
-        }
-      } else if (SeamlessPacketIds.isLevelLoadStartEvent(buf)) {
-        // Straggler "start waiting for chunks" event from the seamless join sequence: the
-        // client already has the shared world, and on ≤1.21.1 this event would open the
-        // "loading terrain" screen unconditionally. See SeamlessSwitchController.
-        if (server.getConfiguration().getSeamlessTransfersConfig().verbose()) {
-          logger.info("Seamless: dropped straggler load-screen event from {} for {}",
-              serverConn.getServerInfo().getName(), serverConn.getPlayer().getUsername());
-        }
-        return;
-      }
+    if (serverConn.getSuppressLoadScreenUntilNanos() != 0 && dropSeamlessJoinStraggler(buf)) {
+      return;
     }
-    if (trackEntityIds) {
-      trackEntityIds(buf);
-    }
-    boolean huge = buf.readableBytes() > LARGE_PACKET_THRESHOLD;
-    playerConnection.delayedWrite(buf.retain());
+    // A no-op (returns buf) unless this server takes part in seamless transfers.
+    final ByteBuf out = serverConn.processSeamlessClientbound(buf.retain());
+    boolean huge = out.readableBytes() > LARGE_PACKET_THRESHOLD;
+    playerConnection.delayedWrite(out);
     if (huge || ++packetsFlushed >= MAXIMUM_PACKETS_TO_FLUSH) {
       playerConnection.flush();
       packetsFlushed = 0;
@@ -540,59 +503,42 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
   }
 
   /**
-   * Tracks the entity ids this server spawns on the client, so a seamless transfer can remove
-   * the leftovers ("ghosts") when the client's level is reused across the switch. Parses only
-   * the leading varints of Spawn Entity / Remove Entities packets; ids are configured in
-   * [seamless-transfers] since they vary by protocol version.
+   * Filters the seamless-join window that follows a hot-swap (see
+   * {@link VelocityServerConnection#getSuppressLoadScreenUntilNanos()}).
    *
-   * <p>Runs on the hot backend→client passthrough path, so the packet id is peeked without
-   * allocating and the vast majority of packets (which are neither Spawn Entity nor Remove
-   * Entities) return before touching the ByteBuf reader index.</p>
+   * @param buf the raw packet
+   * @return true if the packet must be dropped
    */
-  private void trackEntityIds(ByteBuf buf) {
-    final int packetId = peekVarInt(buf, buf.readerIndex());
-    if (packetId != addEntityPacketId && packetId != removeEntitiesPacketId) {
-      return;
+  private boolean dropSeamlessJoinStraggler(ByteBuf buf) {
+    final SeamlessPacketIds.Table ids = serverConn.getSeamlessIds();
+    if (ids == null || System.nanoTime() >= serverConn.getSuppressLoadScreenUntilNanos()) {
+      serverConn.setSuppressLoadScreenUntilNanos(0); // window over: back to the fast path
+      return false;
     }
-    try {
-      final ByteBuf peek = buf.duplicate();
-      ProtocolUtils.readVarInt(peek); // skip the packet id
-      final var tracked = serverConn.getTrackedEntityIds();
-      if (packetId == addEntityPacketId) {
-        if (tracked.size() < MAX_TRACKED_ENTITY_IDS) {
-          tracked.add(ProtocolUtils.readVarInt(peek));
-        }
-      } else {
-        final int count = Math.min(ProtocolUtils.readVarInt(peek), MAX_TRACKED_ENTITY_IDS);
-        for (int i = 0; i < count && peek.isReadable(); i++) {
-          tracked.remove(ProtocolUtils.readVarInt(peek));
-        }
+    final boolean verbose = server.getConfiguration().getSeamlessTransfersConfig().verbose();
+    if (SeamlessPacketIds.peekVarInt(buf) == ids.respawn()) {
+      // Velocity registers Respawn encode-only, so a backend Respawn arrives opaque: a genuine
+      // world change during the seamless-join window. The client rebuilds its level and needs
+      // the "start waiting for chunks" events again — cancel the suppression.
+      serverConn.setSuppressLoadScreenUntilNanos(0);
+      if (verbose) {
+        logger.info("Seamless: live Respawn from {} during the join window for {} — genuine "
+                + "world change, load-screen suppression cancelled (a real reload follows)",
+            serverConn.getServerInfo().getName(), serverConn.getPlayer().getUsername());
       }
-    } catch (Exception e) {
-      // Malformed or truncated varints: ignore, tracking is best-effort.
+      return false;
     }
-  }
-
-  /**
-   * Reads a varint at the given absolute index without moving the reader index or allocating.
-   *
-   * @param buf   the buffer to read from
-   * @param index the absolute index of the varint's first byte
-   * @return the decoded value, or -1 if it is truncated or longer than 3 bytes
-   */
-  private static int peekVarInt(ByteBuf buf, int index) {
-    int result = 0;
-    for (int i = 0; i < 3; i++) {
-      if (buf.writerIndex() <= index + i) {
-        return -1;
+    if (SeamlessPacketIds.isLevelLoadStartEvent(buf, ids)) {
+      // Straggler "start waiting for chunks" event from the seamless join sequence: the client
+      // already has the shared world, and on <=1.21.1 this event would open the "loading
+      // terrain" screen unconditionally. See SeamlessSwitchController.
+      if (verbose) {
+        logger.info("Seamless: dropped straggler load-screen event from {} for {}",
+            serverConn.getServerInfo().getName(), serverConn.getPlayer().getUsername());
       }
-      final byte read = buf.getByte(index + i);
-      result |= (read & 0x7F) << (7 * i);
-      if ((read & 0x80) == 0) {
-        return result;
-      }
+      return true;
     }
-    return -1;
+    return false;
   }
 
   @Override

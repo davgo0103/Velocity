@@ -204,13 +204,13 @@ show-plugins = false
 # EXPERIMENTAL: keep players in the PLAY state when switching between backend servers of the
 # same group, avoiding the "loading terrain" screen. The proxy answers the new server's
 # configuration phase itself and swaps the backend without sending the client any world-switch
-# packet, so the client keeps its rendered world; the new server's "start waiting for chunks"
-# event then resolves on the next frame because the player is already at that (synchronized)
-# position with the chunk loaded. Both servers of a group MUST share the same world template
-# (dimension types, world names) AND synchronize player data INCLUDING the exact position (e.g.
-# via a player-data sync plugin) — if the position differs at all, the client must genuinely
-# load new terrain and the screen cannot be hidden. If those preconditions do not hold, leave
-# this disabled.
+# packet, so the client keeps its rendered world. Both servers of a group MUST share the same
+# world template (dimension types, world names) AND synchronize player data INCLUDING the exact
+# position (e.g. via a player-data sync plugin) — if the position differs at all, the client must
+# genuinely load new terrain and the screen cannot be hidden. Backends must also run with
+# enforce-secure-profile=false (the client only sends its chat session after a JoinGame, which a
+# hot-swap never sends); a backend that enforces secure chat automatically gets the regular
+# switch instead. If those preconditions do not hold, leave this disabled.
 enabled = false
 
 # Groups of servers that share a world template and player data. Seamless transfers only
@@ -218,22 +218,9 @@ enabled = false
 # Example: server-groups = [ ["lobby", "survival"], ["mini1", "mini2"] ]
 server-groups = []
 
-# Commit as soon as this many chunk-sized packets have been buffered. Servers send the chunks
-# closest to the player first, so the area around the player refreshes before the swap; the
-# remaining chunks continue streaming normally afterwards. Roughly (2r+1)^2 for a radius r.
-# Set to 0 to disable and rely on the quiet window/timeout instead.
-commit-chunk-packets = 25
-
-# Packets at least this large (bytes) are considered chunk data for the version-independent
-# snapshot-completion heuristic. Lower this for very sparse worlds (superflat/void).
-chunk-packet-min-bytes = 4096
-
-# Quiet window in milliseconds: once chunk data has been observed, the snapshot is applied
-# after no further chunk-sized packets arrive for this long.
-commit-grace-ms = 150
-
-# Hard deadline in milliseconds after the target server's JoinGame packet; the snapshot is
-# applied even if it may still be incomplete.
+# The swap happens as soon as the new server has sent its first batch of chunks around the
+# player. Hard deadline in milliseconds after the new server's JoinGame packet, in case that
+# batch never arrives; the snapshot is then applied as it is.
 commit-timeout-ms = 2000
 
 # Deadline in milliseconds for the target server to finish login + configuration before the
@@ -241,5 +228,5 @@ commit-timeout-ms = 2000
 prepare-timeout-ms = 5000
 
 # Log the packet timeline (prepare/buffer/commit durations, buffered packet counts) of every
-# seamless switch. Useful for tuning the values above.
+# seamless switch.
 verbose = false

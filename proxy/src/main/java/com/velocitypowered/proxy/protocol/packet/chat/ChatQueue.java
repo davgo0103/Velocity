@@ -100,6 +100,22 @@ public class ChatQueue implements AutoCloseable {
     });
   }
 
+  /**
+   * Switches this queue to the seamless-transfer acknowledgement bridge. See
+   * {@link ChatState#enterSeamlessBridge()}.
+   */
+  public void enterSeamlessBridge() {
+    chatState.enterSeamlessBridge();
+  }
+
+  /**
+   * Records that the current backend delivered a signed player chat message to the client. Only
+   * counted while the seamless bridge is active.
+   */
+  public void onBackendSignedMessage() {
+    chatState.onBackendSignedMessage();
+  }
+
   public void handleAcknowledgement(int offset) {
     queueTask((chatState, smc) -> {
       int ackCountToForward = chatState.accumulateAckCount(offset);
@@ -157,13 +173,64 @@ public class ChatQueue implements AutoCloseable {
     private volatile BitSet lastSeenMessages = new BitSet();
     private final AtomicInteger delayedAckCount = new AtomicInteger();
 
-    private ChatState() {
+    // Seamless-transfer bridge. A hot-swap sends the client no JoinGame, so the client keeps the
+    // "last seen" window and pending acknowledgement count it built up on the previous server,
+    // while the new backend starts from an empty window. Forwarding the client's offsets and
+    // acknowledgements unchanged would acknowledge messages the backend never sent, which it
+    // rejects with a chat validation kick. While bridged, the proxy acknowledges nothing and
+    // forwards at most as many acknowledgements as the backend has signed messages pending.
+    // The client never sends its chat session to the new backend (it only does so after a
+    // JoinGame), so the backend treats its messages as unsigned and the rewritten "last seen"
+    // state does not have to match the client's signatures.
+    private volatile boolean seamlessBridge;
+    private final AtomicInteger backendPendingAcks = new AtomicInteger();
+
+    ChatState() {
+    }
+
+    /**
+     * Enters the seamless-transfer bridge (see the field comment). The bridge stays active until
+     * the queue is discarded, which happens on the next regular server switch.
+     */
+    public void enterSeamlessBridge() {
+      this.seamlessBridge = true;
+      this.backendPendingAcks.set(0);
+      this.delayedAckCount.set(0);
+      this.lastSeenMessages = DUMMY_LAST_SEEN_MESSAGES;
+    }
+
+    /**
+     * Counts a signed player chat message the backend delivered to the client.
+     */
+    public void onBackendSignedMessage() {
+      if (seamlessBridge) {
+        backendPendingAcks.incrementAndGet();
+      }
+    }
+
+    public boolean isSeamlessBridge() {
+      return seamlessBridge;
+    }
+
+    private int takeBackendAcks(int requested) {
+      while (true) {
+        final int pending = backendPendingAcks.get();
+        final int taken = Math.min(Math.max(requested, 0), pending);
+        if (backendPendingAcks.compareAndSet(pending, pending - taken)) {
+          return taken;
+        }
+      }
     }
 
     @Nullable
     public LastSeenMessages updateFromMessage(@Nullable Instant timestamp, @Nullable LastSeenMessages lastSeenMessages) {
       if (timestamp != null) {
         this.lastTimestamp = timestamp;
+      }
+      if (lastSeenMessages != null && seamlessBridge) {
+        // Acknowledge nothing (always valid) and never more than the backend has pending.
+        return new LastSeenMessages(takeBackendAcks(lastSeenMessages.getOffset()),
+            new BitSet(), (byte) 0);
       }
       if (lastSeenMessages != null) {
         // We held back some acknowledged messages, so flush that out now that we have a known 'last seen' state again
@@ -175,6 +242,10 @@ public class ChatQueue implements AutoCloseable {
     }
 
     public int accumulateAckCount(int ackCount) {
+      if (seamlessBridge) {
+        // The bridged "last seen" state is always empty, so nothing needs to be held back.
+        return takeBackendAcks(ackCount);
+      }
       int delayedAckCount = this.delayedAckCount.addAndGet(ackCount);
       int ackCountToForward = delayedAckCount - MINIMUM_DELAYED_ACK_COUNT;
       if (ackCountToForward >= LastSeenMessages.WINDOW_SIZE) {

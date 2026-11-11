@@ -38,7 +38,11 @@ import com.velocitypowered.proxy.protocol.packet.ServerboundPlayerLoadedPacket;
 import io.netty.buffer.ByteBuf;
 import io.netty.util.ReferenceCountUtil;
 import java.util.ArrayDeque;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import org.apache.logging.log4j.LogManager;
@@ -51,9 +55,8 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * which resets the client and shows a loading screen, the proxy answers the target server's
  * configuration phase itself, buffers its initial packets, and swaps the backend without sending
  * the client any world-switch packet — so the client keeps its rendered world. The target's
- * "start waiting for chunks" event is forwarded unchanged; because the player is already at the
- * same (synchronized) position with the chunk loaded, that wait resolves on the next frame and no
- * loading screen is perceptible.
+ * "start waiting for chunks" event is suppressed for same-world joins, since the client already
+ * has the shared world loaded (see {@link SeamlessPacketIds#isLevelLoadStartEvent}).
  *
  * <p>State machine: {@code PREPARING} (target logging in / configuring) → {@code BUFFERING}
  * (target in PLAY, snapshot packets accumulating) → {@code COMMITTING} → {@code LIVE}. Any error
@@ -66,6 +69,13 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 public final class SeamlessSwitchController {
 
   private static final Logger logger = LogManager.getLogger(SeamlessSwitchController.class);
+
+  /**
+   * Servers found to enforce secure chat (lower-case names). The client only sends its chat
+   * session after a JoinGame, which a hot-swap never sends, so such a server would reject the
+   * player's first chat message; transfers to it use the regular switch until the proxy restarts.
+   */
+  private static final Set<String> SECURE_CHAT_SERVERS = ConcurrentHashMap.newKeySet();
 
   /**
    * The state of a seamless switch attempt.
@@ -89,22 +99,18 @@ public final class SeamlessSwitchController {
   private final VelocityServerConnection target;
   private final CompletableFuture<Impl> resultFuture;
   private final SeamlessTransfersConfig config;
-  private final int chunkBatchFinishedId;
-  private final int respawnId;
+  private final SeamlessPacketIds.Table ids;
 
   private State state = State.PREPARING;
   private final ArrayDeque<Object> buffer = new ArrayDeque<>();
   private @Nullable JoinGamePacket targetJoinGame;
   private @Nullable ScheduledFuture<?> prepareTimeoutTask;
   private @Nullable ScheduledFuture<?> commitTimeoutTask;
-  private @Nullable ScheduledFuture<?> graceCheckTask;
 
   // Instrumentation, logged on commit.
   private final long prepareStartNanos = System.nanoTime();
   private long joinGameNanos;
-  private long lastChunkPacketNanos;
   private int bufferedTargetPackets;
-  private int chunkSizedPacketsSeen;
   private int droppedSourcePackets;
   private int suppressedLoadScreenEvents;
   private boolean worldChangeSeen;
@@ -125,14 +131,8 @@ public final class SeamlessSwitchController {
     this.target = target;
     this.resultFuture = resultFuture;
     this.config = server.getConfiguration().getSeamlessTransfersConfig();
-    this.chunkBatchFinishedId = SeamlessPacketIds.chunkBatchFinishedId(player.getProtocolVersion());
-    this.respawnId = SeamlessPacketIds.respawnId(player.getProtocolVersion());
-    if (!SeamlessPacketIds.entityCleanupSupported(player.getProtocolVersion())) {
-      logger.warn("Seamless transfer for {}: entity packet ids are not known for {}; the "
-              + "previous server's entities cannot be cleaned up and will linger as ghosts "
-              + "(add the version to SeamlessPacketIds to enable cleanup)",
-          player.getUsername(), player.getProtocolVersion());
-    }
+    // Non-null: isEligible() only admits versions present in the table.
+    this.ids = Objects.requireNonNull(SeamlessPacketIds.forVersion(player.getProtocolVersion()));
     this.prepareTimeoutTask = player.getConnection().eventLoop().schedule(this::onPrepareTimeout,
         config.prepareTimeoutMs(), TimeUnit.MILLISECONDS);
   }
@@ -154,6 +154,13 @@ public final class SeamlessSwitchController {
     if (player.getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
       // Older clients do not use the configuration state, so the config-reset flicker this
       // avoids does not exist there; the regular fast switch is already smooth.
+      return false;
+    }
+    if (!SeamlessPacketIds.isSupported(player.getProtocolVersion())) {
+      // Packet ids unknown for this version: use the regular switch rather than guess.
+      return false;
+    }
+    if (SECURE_CHAT_SERVERS.contains(target.getServerInfo().getName().toLowerCase(Locale.ROOT))) {
       return false;
     }
     if (player.getConnection().getType() != ConnectionTypes.VANILLA) {
@@ -193,15 +200,56 @@ public final class SeamlessSwitchController {
     if (state != State.PREPARING) {
       return;
     }
+    if (joinGame.getEnforcesSecureChat()) {
+      retryAsRegularSwitch();
+      return;
+    }
     this.targetJoinGame = joinGame;
     this.state = State.BUFFERING;
     this.joinGameNanos = System.nanoTime();
-    this.lastChunkPacketNanos = joinGameNanos;
     cancel(prepareTimeoutTask);
     prepareTimeoutTask = null;
     this.commitTimeoutTask = player.getConnection().eventLoop().schedule(
         () -> commit("timeout"), config.commitTimeoutMs(), TimeUnit.MILLISECONDS);
-    scheduleGraceCheck(config.commitGraceMs());
+  }
+
+  /**
+   * Gives up on the seamless path for a target that enforces secure chat and connects to it
+   * again through the regular switch, completing the original connection request with that
+   * attempt's result — the player only notices the usual loading screen.
+   */
+  private void retryAsRegularSwitch() {
+    final String name = target.getServerInfo().getName();
+    if (SECURE_CHAT_SERVERS.add(name.toLowerCase(Locale.ROOT))) {
+      logger.warn("Seamless transfers to {} are disabled until the proxy restarts: it enforces "
+          + "secure chat (enforce-secure-profile=true). A hot-swap sends the client no JoinGame, "
+          + "so the client never sends its chat session to {} and could not chat there. Set "
+          + "enforce-secure-profile=false on {} to use seamless transfers.", name, name, name);
+    }
+    state = State.ABORTED;
+    cancel(prepareTimeoutTask);
+    cancel(commitTimeoutTask);
+    releaseBuffer();
+    player.clearSeamlessSwitchController(this);
+    target.disconnect();
+
+    final VelocityServerConnection retry = new VelocityServerConnection(target.getServer(),
+        source != null ? source.getServer() : null, player, server);
+    if (!player.replaceConnectionInFlight(target, retry)) {
+      resultFuture.complete(ConnectionRequestResults.forDisconnect(
+          ConnectionMessages.INTERNAL_SERVER_CONNECTION_ERROR, target.getServer()));
+      return;
+    }
+    retry.connect().whenComplete((result, exc) -> {
+      // Hand the in-flight slot back so the original request's bookkeeping can clear it (on
+      // success the regular flow has already cleared it).
+      player.replaceConnectionInFlight(retry, target);
+      if (exc != null) {
+        resultFuture.completeExceptionally(exc);
+      } else {
+        resultFuture.complete(result);
+      }
+    });
   }
 
   /**
@@ -232,15 +280,16 @@ public final class SeamlessSwitchController {
     if (state != State.BUFFERING && state != State.COMMITTING) {
       return;
     }
-    if (respawnId >= 0 && SeamlessPacketIds.peekVarInt(buf) == respawnId) {
+    final int packetId = SeamlessPacketIds.peekVarInt(buf);
+    if (packetId == ids.respawn()) {
       // A genuine world change inside the target's join sequence (Velocity registers Respawn
       // encode-only, so it arrives opaque and must be recognized by id). The client will
       // rebuild its level when this is flushed, so the "start waiting for chunks" events are
       // needed after all — stop suppressing them for this transfer.
       worldChangeSeen = true;
     }
-    if (!worldChangeSeen && SeamlessPacketIds.isLevelLoadStartEvent(buf)) {
-      // Never let the client see this event during a same-world seamless join: on ≤1.21.1 it
+    if (!worldChangeSeen && SeamlessPacketIds.isLevelLoadStartEvent(buf, ids)) {
+      // Never let the client see this event during a same-world seamless join: on <=1.21.1 it
       // opens the "loading terrain" screen unconditionally, even though the shared world is
       // already loaded, producing an intermittent one-frame flash. BackendPlaySessionHandler
       // keeps dropping stragglers for a window after the commit. If a Respawn was buffered
@@ -250,54 +299,17 @@ public final class SeamlessSwitchController {
     }
     buffer.add(buf.retain());
     bufferedTargetPackets++;
-    if (state != State.BUFFERING) {
-      // Already committing; just collect for the flush.
-      return;
-    }
-    // Primary trigger: the server sends "Chunk Batch Finished" once it has streamed a batch of
-    // initial chunks. Committing here means the client's surroundings are in the buffer,
-    // independent of how large the chunk packets compress to (unlike the size heuristic below).
-    if (chunkBatchFinishedId >= 0 && SeamlessPacketIds.peekVarInt(buf) == chunkBatchFinishedId) {
+    // Commit once the server has streamed its first batch of initial chunks ("Chunk Batch
+    // Finished"): the client's surroundings are then in the buffer. Every supported version
+    // (1.20.2+) batches chunks, so this is the only trigger besides the timeout.
+    if (state == State.BUFFERING && packetId == ids.chunkBatchFinished()) {
       commit("chunk-batch");
-      return;
-    }
-    if (buf.readableBytes() >= config.chunkPacketMinBytes()) {
-      // Fallback for versions without a known Chunk Batch Finished id: chunk data is far larger
-      // than the steady tick traffic (time updates, entity movement), so a quiet window on these
-      // large packets approximates "the initial chunks have stopped arriving".
-      chunkSizedPacketsSeen++;
-      lastChunkPacketNanos = System.nanoTime();
-      if (config.commitChunkPackets() > 0
-          && chunkSizedPacketsSeen >= config.commitChunkPackets()) {
-        commit("chunks");
-      }
     }
   }
 
   /** Called by the discard handler installed on the source connection during the swap window. */
   void onSourcePacketDropped() {
     droppedSourcePackets++;
-  }
-
-  private void scheduleGraceCheck(long delayMs) {
-    graceCheckTask = player.getConnection().eventLoop().schedule(this::graceCheck,
-        delayMs, TimeUnit.MILLISECONDS);
-  }
-
-  private void graceCheck() {
-    if (state != State.BUFFERING) {
-      return;
-    }
-    // A live server never goes fully quiet (time updates and entity movement arrive every tick),
-    // so the quiet window only considers chunk-sized packets: once the initial chunk burst stops
-    // for commitGraceMs, the snapshot is as complete as it will get.
-    final long chunkQuietMs =
-        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastChunkPacketNanos);
-    if (chunkSizedPacketsSeen > 0 && chunkQuietMs >= config.commitGraceMs()) {
-      commit("grace");
-    } else {
-      scheduleGraceCheck(Math.max(config.commitGraceMs() - chunkQuietMs, 20));
-    }
   }
 
   private void onPrepareTimeout() {
@@ -321,9 +333,7 @@ public final class SeamlessSwitchController {
     }
     state = State.COMMITTING;
     cancel(commitTimeoutTask);
-    cancel(graceCheckTask);
     commitTimeoutTask = null;
-    graceCheckTask = null;
 
     final long commitStartNanos = System.nanoTime();
     final MinecraftConnection smc = target.ensureConnected();
@@ -396,13 +406,12 @@ public final class SeamlessSwitchController {
             final long now = System.nanoTime();
             logger.info("Seamless transfer for {} -> {} committed ({}): prepare={}ms, "
                     + "buffer={}ms, commit={}ms, bufferedTargetPackets={}, "
-                    + "chunkSizedPackets={}, suppressedLoadScreenEvents={}, worldChange={}, "
-                    + "droppedSourcePackets={}",
+                    + "suppressedLoadScreenEvents={}, worldChange={}, droppedSourcePackets={}",
                 player.getUsername(), target.getServerInfo().getName(), trigger,
                 TimeUnit.NANOSECONDS.toMillis(joinGameNanos - prepareStartNanos),
                 TimeUnit.NANOSECONDS.toMillis(commitStartNanos - joinGameNanos),
                 TimeUnit.NANOSECONDS.toMillis(now - commitStartNanos),
-                bufferedTargetPackets, chunkSizedPacketsSeen, suppressedLoadScreenEvents,
+                bufferedTargetPackets, suppressedLoadScreenEvents,
                 worldChangeSeen, droppedSourcePackets);
           }
         }, smc.eventLoop()).exceptionally(exc -> {
@@ -429,7 +438,6 @@ public final class SeamlessSwitchController {
     state = State.ABORTED;
     cancel(prepareTimeoutTask);
     cancel(commitTimeoutTask);
-    cancel(graceCheckTask);
     releaseBuffer();
     player.clearSeamlessSwitchController(this);
     target.disconnect();
@@ -455,7 +463,6 @@ public final class SeamlessSwitchController {
     state = State.ABORTED;
     cancel(prepareTimeoutTask);
     cancel(commitTimeoutTask);
-    cancel(graceCheckTask);
     releaseBuffer();
     player.clearSeamlessSwitchController(this);
   }

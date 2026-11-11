@@ -40,6 +40,7 @@ import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
 import com.velocitypowered.proxy.connection.backend.BackendConnectionPhases;
 import com.velocitypowered.proxy.connection.backend.BungeeCordMessageResponder;
+import com.velocitypowered.proxy.connection.backend.SeamlessEntityIdRemapper;
 import com.velocitypowered.proxy.connection.backend.SeamlessPacketIds;
 import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.connection.forge.legacy.LegacyForgeConstants;
@@ -202,6 +203,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   @Override
   public void deactivated() {
     player.discardChatQueue();
+    // Leaving PLAY: the client will adopt the next JoinGame's entity id.
+    player.setEntityIdRemapper(null);
     PluginMessagePacket message;
     while ((message = loginPluginMessages.poll()) != null) {
       ReferenceCountUtil.release(message);
@@ -566,7 +569,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         && serverConnection.getPhase().consideredComplete()
         && smc.getState() == StateRegistry.PLAY;
     if (stateAllowsForward) {
-      smc.write(buf.retain());
+      final SeamlessEntityIdRemapper remapper = player.getEntityIdRemapper();
+      final ByteBuf out = remapper != null ? remapper.rewriteServerbound(buf) : buf;
+      smc.write(out == buf ? buf.retain() : out);
     }
   }
 
@@ -675,6 +680,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
 
     destination.setEntityId(joinGame.getEntityId()); // used for sound api
+    // The client received this JoinGame (or the respawn built from it), so it now uses the
+    // backend's entity id itself: any translation left by a seamless transfer is obsolete.
+    player.setEntityIdRemapper(null);
     if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
       player.getBossBarManager().sendBossBars();
     } else {
@@ -745,9 +753,10 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   /**
    * Applies a seamless (PLAY-state) server switch: instead of the configuration-state reset, the
-   * client receives a same-dimension respawn followed immediately by the buffered world snapshot
-   * of the target server, all in a single flush. Leftover UI state from the previous server (tab
-   * list, header/footer, boss bars, titles) is cleared in the same batch.
+   * client receives the buffered world snapshot of the target server in a single flush, without
+   * any world-switch packet. Leftover state from the previous server (tab list, header/footer,
+   * boss bars, titles, entities, weather) is cleared in the same batch, and the player's entity
+   * id and chat acknowledgements are bridged to the target from here on.
    *
    * <p>Must be called on the player's event loop while the client is in the PLAY state; the
    * buffered messages are written in their original order and ownership of their reference
@@ -787,29 +796,53 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     // Hot-swap: no world-switch packet at all — a JoinGame or Respawn would put the client
     // into the waiting-for-level screen state. The client keeps its level (both servers share
     // the same world template, so the terrain on screen is already correct) and the target's
-    // position sync, chunks and entity spawns in the snapshot simply take over. The previous
-    // server's entities survive and are removed explicitly (when entity tracking is
-    // configured); the player also keeps its old entity id (see TODO below).
+    // position sync, chunks and entity spawns in the snapshot simply take over.
+    final SeamlessPacketIds.Table ids = SeamlessPacketIds.forVersion(player.getProtocolVersion());
     final VelocityServerConnection previous = player.getConnectedServer();
-    final int removeEntitiesId = SeamlessPacketIds.removeEntitiesId(player.getProtocolVersion());
-    if (previous != null && removeEntitiesId >= 0) {
-      final var ghosts = previous.getTrackedEntityIds();
-      if (!ghosts.isEmpty()) {
-        final ByteBuf removeGhosts = Unpooled.buffer();
-        ProtocolUtils.writeVarInt(removeGhosts, removeEntitiesId);
-        ProtocolUtils.writeVarInt(removeGhosts, ghosts.size());
-        for (int ghostId : ghosts) {
-          ProtocolUtils.writeVarInt(removeGhosts, ghostId);
+
+    // The client also keeps its entity id, while the target refers to the player by its own:
+    // translate between the two from now on (see SeamlessEntityIdRemapper).
+    final SeamlessEntityIdRemapper previousRemapper = player.getEntityIdRemapper();
+    final int clientEntityId = previousRemapper != null ? previousRemapper.clientId()
+        : previous != null && previous.getEntityId() != null ? previous.getEntityId()
+        : joinGame.getEntityId();
+    final SeamlessEntityIdRemapper remapper =
+        SeamlessEntityIdRemapper.create(clientEntityId, joinGame.getEntityId(), ids);
+    player.setEntityIdRemapper(remapper);
+
+    if (ids != null) {
+      // The previous server's entities survive in the client's level; remove them. Tracked ids
+      // are already in the client's id space.
+      if (previous != null) {
+        final var ghosts = previous.getTrackedEntityIds();
+        ghosts.remove(clientEntityId);
+        if (!ghosts.isEmpty()) {
+          final ByteBuf removeGhosts = Unpooled.buffer();
+          ProtocolUtils.writeVarInt(removeGhosts, ids.removeEntities());
+          ProtocolUtils.writeVarInt(removeGhosts, ghosts.size());
+          for (int ghostId : ghosts) {
+            ProtocolUtils.writeVarInt(removeGhosts, ghostId);
+          }
+          clientConn.delayedWrite(removeGhosts);
         }
-        clientConn.delayedWrite(removeGhosts);
       }
+      // Weather is world state the client keeps as well: clear it (rain level and thunder level
+      // game events, 7 and 8). The client does not advance these on its own, and the target
+      // re-sends its weather in the join sequence when it is raining, overriding the zeros.
+      clientConn.delayedWrite(SeamlessPacketIds.gameEvent(ids, 7, 0f, Unpooled.buffer()));
+      clientConn.delayedWrite(SeamlessPacketIds.gameEvent(ids, 8, 0f, Unpooled.buffer()));
     }
+
+    // Signed chat acknowledgements must be bridged to the target's empty "last seen" window.
+    player.getChatQueue().enterSeamlessBridge();
 
     // Stream the buffered snapshot to the client. The client keeps its rendered world; these
     // packets (position, chunks, entity spawns, inventory, ...) update it in place.
     Object msg;
     while ((msg = buffered.poll()) != null) {
-      if (msg instanceof BundleDelimiterPacket) {
+      if (msg instanceof ByteBuf raw) {
+        msg = destination.processSeamlessClientbound(raw);
+      } else if (msg instanceof BundleDelimiterPacket) {
         player.getBundleHandler().toggleBundleSession();
       } else if (msg instanceof UpsertPlayerInfoPacket upsert) {
         player.getTabList().processUpdate(upsert);
@@ -834,9 +867,6 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
     clientConn.flush();
 
-    // TODO(seamless): the client keeps its old player entity id across the hot-swap, so target
-    // packets that refer to the player (or to a colliding id) by entity id are misapplied or
-    // dropped; a player-id rewrite would be needed to close this gap completely.
     destination.setEntityId(joinGame.getEntityId());
 
     // Tell the server about the proxy's and the client's plugin message channels, and flush any

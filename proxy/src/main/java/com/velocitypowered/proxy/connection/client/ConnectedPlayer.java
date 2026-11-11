@@ -61,6 +61,7 @@ import com.velocitypowered.proxy.VelocityServer;
 import com.velocitypowered.proxy.adventure.VelocityBossBarImplementation;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.MinecraftConnectionAssociation;
+import com.velocitypowered.proxy.connection.backend.SeamlessEntityIdRemapper;
 import com.velocitypowered.proxy.connection.backend.SeamlessSwitchController;
 import com.velocitypowered.proxy.connection.backend.VelocityServerConnection;
 import com.velocitypowered.proxy.connection.player.bossbar.BossBarManager;
@@ -182,6 +183,7 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
   private @Nullable VelocityServerConnection connectedServer;
   private @Nullable VelocityServerConnection connectionInFlight;
   private @Nullable SeamlessSwitchController seamlessSwitchController;
+  private @Nullable SeamlessEntityIdRemapper entityIdRemapper;
   private @Nullable PlayerSettings settings;
   private @Nullable ModInfo modInfo;
   private final Set<VelocityBossBarImplementation> bossBars = new HashSet<>();
@@ -1058,7 +1060,8 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
       return;
     }
 
-    connection.write(new ClientboundSoundEntityPacket(sound, null, soundEmitterServerConn.getEntityId()));
+    connection.write(new ClientboundSoundEntityPacket(sound, null,
+        toClientEntityId(soundEmitterServerConn.getEntityId())));
   }
 
   @Override
@@ -1448,6 +1451,48 @@ public class ConnectedPlayer implements MinecraftConnectionAssociation, Player, 
     if (this.seamlessSwitchController == controller) {
       this.seamlessSwitchController = null;
     }
+  }
+
+  /**
+   * Returns the entity id translation installed by a seamless transfer, if the client's entity
+   * id differs from the current backend's.
+   *
+   * @return the remapper, or null when no translation is needed
+   */
+  public @Nullable SeamlessEntityIdRemapper getEntityIdRemapper() {
+    return entityIdRemapper;
+  }
+
+  public void setEntityIdRemapper(@Nullable SeamlessEntityIdRemapper remapper) {
+    this.entityIdRemapper = remapper;
+  }
+
+  /**
+   * Translates a backend entity id into the id the client knows the entity by.
+   *
+   * @param backendEntityId the entity id used by the current backend
+   * @return the id to use in packets the proxy sends to the client
+   */
+  public int toClientEntityId(int backendEntityId) {
+    final SeamlessEntityIdRemapper remapper = entityIdRemapper;
+    return remapper != null ? remapper.map(backendEntityId) : backendEntityId;
+  }
+
+  /**
+   * Replaces the in-flight connection, used when a seamless attempt is retried as a regular
+   * switch on a fresh backend connection.
+   *
+   * @param expected    the connection that must currently be in flight
+   * @param replacement the new in-flight connection
+   * @return true if the replacement happened
+   */
+  public boolean replaceConnectionInFlight(VelocityServerConnection expected,
+      VelocityServerConnection replacement) {
+    if (connectionInFlight != expected) {
+      return false;
+    }
+    connectionInFlight = replacement;
+    return true;
   }
 
   private final class ConnectionRequestBuilderImpl implements ConnectionRequestBuilder {
